@@ -1,0 +1,1067 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Scene Annotation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --ink: #1a1a2e;
+            --ink2: #4a4a6a;
+            --ink3: #8888aa;
+            --surface: #ffffff;
+            --surface2: #f4f4f8;
+            --surface3: #eeeef6;
+            --accent: #5b4fcf;
+            --accent2: #7b6fe8;
+            --accent-bg: #eeedfb;
+            --warn: #c85a00;
+            --warn-bg: #fff4ec;
+            --ok: #1a7a4a;
+            --ok-bg: #eaf7f0;
+            --err: #b52020;
+            --err-bg: #fdf0f0;
+            --border: #e0e0ec;
+            --radius: 10px;
+            --font: 'DM Sans', sans-serif;
+            --mono: 'DM Mono', monospace;
+            --conditional-bg: #f0f4ff;
+            --conditional-border: #c5d0f5;
+        }
+
+        body {
+            font-family: var(--font);
+            background: var(--surface2);
+            color: var(--ink);
+            min-height: 100vh;
+            padding: 32px 16px 80px;
+            font-size: 15px;
+        }
+
+        .shell { max-width: 860px; margin: 0 auto; }
+
+        /* ── Header ── */
+        .hdr {
+            background: var(--accent);
+            border-radius: 14px 14px 0 0;
+            padding: 22px 28px 18px;
+            color: #fff;
+        }
+        .hdr h1 { font-size: 19px; font-weight: 600; letter-spacing: -.2px; }
+        .hdr .sub { font-size: 13px; opacity: .75; margin-top: 3px; }
+        .hdr .badge {
+            display: inline-block;
+            background: rgba(255,255,255,.18);
+            border-radius: 20px;
+            padding: 2px 10px;
+            font-size: 12px;
+            font-family: var(--mono);
+            margin-top: 8px;
+        }
+
+        /* ── Card body ── */
+        .body {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-top: none;
+            border-radius: 0 0 14px 14px;
+            padding: 28px;
+        }
+
+        /* ── Scene image ── */
+        .scene-img { width: 100%; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 28px; display: block; }
+        .no-img {
+            height: 140px; border-radius: var(--radius);
+            border: 1.5px dashed var(--border); background: var(--surface2);
+            display: flex; align-items: center; justify-content: center;
+            color: var(--ink3); font-size: 14px; margin-bottom: 28px;
+        }
+
+        /* ── Section labels ── */
+        .sec-label {
+            font-size: 11px; font-weight: 600; letter-spacing: .1em;
+            text-transform: uppercase; color: var(--accent);
+            margin-bottom: 14px; padding-bottom: 7px;
+            border-bottom: 2px solid var(--accent-bg);
+        }
+
+        /* ── Field ── */
+        .field { margin-bottom: 16px; }
+        .field label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 5px; color: var(--ink); }
+        .field label .req { color: #c00; margin-left: 2px; }
+        .field label .hint { font-weight: 400; color: var(--ink3); font-size: 12px; margin-left: 6px; }
+
+        input[type=text], input[type=number], textarea, select {
+            width: 100%; padding: 9px 12px; font-size: 14px;
+            font-family: var(--font); border: 1.5px solid var(--border);
+            border-radius: var(--radius); background: var(--surface);
+            color: var(--ink); transition: border-color .15s, box-shadow .15s;
+        }
+        input:focus, textarea:focus, select:focus {
+            outline: none; border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(91,79,207,.12);
+        }
+        .invalid { border-color: var(--err) !important; box-shadow: 0 0 0 3px rgba(181,32,32,.1) !important; }
+
+        textarea { min-height: 130px; resize: vertical; line-height: 1.6; }
+
+        /* ── Word counter ── */
+        .word-counter { font-size: 12px; color: var(--ink3); margin-top: 5px; display: flex; justify-content: space-between; align-items: center; }
+        .word-counter.warning { color: var(--warn); }
+        .word-counter.ok { color: var(--ok); }
+
+        /* ── Checklist pills ── */
+        .checklist {
+            display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
+        }
+        .check-pill {
+            font-size: 11px; padding: 3px 9px; border-radius: 20px;
+            font-weight: 500; border: 1.5px solid var(--border);
+            color: var(--ink3); background: var(--surface2);
+            transition: all .2s;
+        }
+        .check-pill.found { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
+
+        /* ── Instruction box ── */
+        .instruction-box {
+            background: var(--accent-bg); border: 1.5px solid #d4cef2;
+            border-left: 4px solid var(--accent);
+            border-radius: 0 var(--radius) var(--radius) 0;
+            padding: 12px 14px; font-size: 13px; color: #3a2fa0;
+            line-height: 1.65; margin-bottom: 14px;
+        }
+        .instruction-box strong { font-weight: 600; }
+        .instruction-box ol { margin: 8px 0 0 18px; }
+        .instruction-box li { margin-bottom: 3px; }
+
+        /* ── MCQ grid ── */
+        .mcq-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+        .mcq-grid .field { margin-bottom: 0; }
+        @media (max-width: 520px) { .mcq-grid { grid-template-columns: 1fr; } }
+
+        /* ── Objects section ── */
+        .obj-list { display: grid; gap: 16px; margin-bottom: 14px; }
+
+        .obj-card {
+            background: var(--surface2); border: 1.5px solid var(--border);
+            border-radius: var(--radius); padding: 18px; transition: border-color .2s;
+        }
+        .obj-card:focus-within { border-color: var(--accent2); }
+
+        .obj-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+        .obj-card-num {
+            font-size: 11px; font-weight: 600; letter-spacing: .08em;
+            text-transform: uppercase; color: var(--accent); background: var(--accent-bg);
+            border-radius: 20px; padding: 2px 10px;
+        }
+        .obj-card-remove {
+            background: none; border: none; color: var(--ink3); cursor: pointer;
+            font-size: 17px; padding: 3px 6px; border-radius: 4px;
+            transition: background .15s, color .15s;
+        }
+        .obj-card-remove:hover { background: var(--err-bg); color: var(--err); }
+
+        .obj-top-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+        @media (max-width: 580px) { .obj-top-row { grid-template-columns: 1fr; } }
+
+        /* Per-instance divider */
+        .instance-block {
+            border-top: 1.5px solid var(--border);
+            padding-top: 14px; margin-top: 14px;
+        }
+        .instance-title {
+            font-size: 12px; font-weight: 600; color: var(--ink2);
+            margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+        }
+        .instance-title::before {
+            content: ''; display: inline-block; width: 6px; height: 6px;
+            border-radius: 50%; background: var(--accent2);
+        }
+        .instance-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; }
+        .instance-fields .field { margin-bottom: 0; }
+        .instance-fields .field label { font-size: 12px; }
+        .instance-fields .field input, .instance-fields .field select { font-size: 13px; padding: 8px 10px; }
+        .full-width { grid-column: 1 / -1 !important; }
+
+        /* ── Add object button ── */
+        .btn-add-object {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 9px 16px; border: 1.5px dashed var(--border);
+            border-radius: var(--radius); background: transparent;
+            color: var(--accent); font-size: 13px; font-weight: 500;
+            font-family: var(--font); cursor: pointer; transition: all .15s;
+        }
+        .btn-add-object:hover { border-color: var(--accent); background: var(--accent-bg); }
+
+        /* ── Conditional scene questions ── */
+        .conditional-section {
+            background: var(--conditional-bg);
+            border: 1.5px solid var(--conditional-border);
+            border-left: 4px solid var(--accent2);
+            border-radius: 0 var(--radius) var(--radius) 0;
+            padding: 16px 18px;
+            margin-top: 16px;
+        }
+        .conditional-section .sec-label {
+            color: #2d3db0; border-color: var(--conditional-border); margin-bottom: 12px;
+        }
+        .conditional-q {
+            background: var(--surface); border: 1.5px solid var(--conditional-border);
+            border-radius: var(--radius); padding: 14px; margin-bottom: 10px;
+            animation: fadeSlide .2s ease;
+        }
+        .conditional-q:last-child { margin-bottom: 0; }
+        .conditional-q .q-label {
+            font-size: 13px; font-weight: 500; color: var(--ink);
+            margin-bottom: 6px; display: flex; align-items: flex-start; gap: 6px;
+        }
+        .conditional-q .q-label .q-tag {
+            font-size: 10px; font-weight: 600; letter-spacing: .06em;
+            text-transform: uppercase; background: var(--accent-bg);
+            color: var(--accent); border-radius: 4px; padding: 2px 6px;
+            white-space: nowrap; margin-top: 1px;
+        }
+        .conditional-q .q-label .req { color: #c00; }
+
+        @keyframes fadeSlide {
+            from { opacity: 0; transform: translateY(-6px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ── Buttons ── */
+        .btn {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 10px 20px; border: none; border-radius: var(--radius);
+            font-size: 14px; font-weight: 500; font-family: var(--font);
+            cursor: pointer; transition: opacity .15s, transform .1s;
+        }
+        .btn:active { transform: scale(.98); }
+        .btn:disabled { opacity: .4; cursor: not-allowed; }
+        .btn-primary { background: var(--accent); color: #fff; }
+        .btn-secondary { background: var(--surface3); color: var(--ink2); border: 1.5px solid var(--border); }
+        .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+
+        /* ── Spinner ── */
+        .spin {
+            display: inline-block; width: 13px; height: 13px;
+            border: 2px solid currentColor; border-top-color: transparent;
+            border-radius: 50%; animation: rot .65s linear infinite;
+        }
+        @keyframes rot { to { transform: rotate(360deg); } }
+
+        /* ── Status ── */
+        .status { margin-top: 14px; padding: 11px 14px; border-radius: var(--radius); font-size: 14px; display: none; }
+        .status.info  { display: block; background: #e8f0fd; color: #1a3a8c; }
+        .status.ok    { display: block; background: var(--ok-bg); color: var(--ok); }
+        .status.warn  { display: block; background: var(--warn-bg); color: var(--warn); }
+        .status.err   { display: block; background: var(--err-bg); color: var(--err); }
+
+        /* ── Done ── */
+        .done { display: none; text-align: center; padding: 48px 20px; }
+        .done.on { display: block; }
+        .done-check {
+            width: 52px; height: 52px; border-radius: 50%; background: var(--ok-bg);
+            display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;
+        }
+        .done-check svg { width: 26px; height: 26px; stroke: var(--ok); fill: none; stroke-width: 2.5; }
+        .done h2 { font-size: 20px; font-weight: 500; color: var(--ok); margin-bottom: 8px; }
+        .done p { font-size: 14px; color: var(--ink3); }
+
+        hr.divider { border: none; border-top: 1.5px solid var(--border); margin: 24px 0; }
+
+        /* hazard field */
+        #hazardsDescriptionField, #videoOnlyFields { transition: all .2s; }
+    </style>
+</head>
+<body>
+<div class="shell">
+    <div class="hdr">
+        <h1>Scene Annotation Form</h1>
+        <p class="sub">Provide detailed and comprehensive observations about this scene</p>
+        <span class="badge" id="sceneIdLabel">scene: —</span>
+    </div>
+
+    <div class="body" id="mainBody">
+        <div id="imgContainer"></div>
+
+        <!-- ── Participant ── -->
+        <div class="sec-label">Your information</div>
+        <div class="field">
+            <label for="participantId">Name <span class="req">*</span></label>
+            <input type="text" id="participantId" required placeholder="Enter your name">
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Scene Conditions ── -->
+        <div class="sec-label">Scene conditions</div>
+        <div class="mcq-grid">
+            <div class="field">
+                <label for="f_environment">Environment <span class="req">*</span></label>
+                <select id="f_environment" required onchange="renderConditionalQuestions()">
+                    <option value="">— select —</option>
+                    <option>urban street</option>
+                    <option>highway</option>
+                    <option>parking lot</option>
+                    <option>intersection</option>
+                    <option>residential area</option>
+                    <option>school zone</option>
+                    <option>construction zone</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="f_lighting">Lighting <span class="req">*</span></label>
+                <select id="f_lighting" required onchange="renderConditionalQuestions()">
+                    <option value="">— select —</option>
+                    <option>bright daylight</option>
+                    <option>low-light</option>
+                    <option>night with street lights</option>
+                    <option>night without lighting</option>
+                </select>
+            </div>
+
+
+            <div class="field">
+                <label for="f_traffic_density">Traffic density</label>
+                <select id="f_traffic_density" onchange="renderConditionalQuestions()">
+                    <option value="">— select —</option>
+                    <option>empty</option>
+                    <option>light</option>
+                    <option>moderate</option>
+                    <option>heavy</option>
+                    <option>gridlock</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="f_traffic_flow">Traffic flow</label>
+                <select id="f_traffic_flow">
+                    <option value="">— select —</option>
+                    <option>free-flowing</option>
+                    <option>slow-moving</option>
+                    <option>stopped</option>
+                    <option>mixed</option>
+                    <option>one-directional</option>
+                    <option>bidirectional</option>
+                </select>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Narrative ── -->
+        <div class="sec-label">Scene description (narrative)</div>
+        <div class="instruction-box">
+            <strong>Minimum 40 words required.</strong> Describe the image/video as thoroughly as possible. Cover all five points:
+            <ol>
+                <li><strong>Scene type</strong> — what kind of place is this?</li>
+                <li><strong>All visible objects</strong> — include type, color, size, and position for each</li>
+                <li><strong>Activity & behavior</strong> — what is happening? Are things moving, stopped, interacting?</li>
+                <li><strong>Hazards or unusual events</strong> — anything dangerous, unexpected, or out of place?</li>
+                <li><strong>Spatial layout</strong> — what's in the foreground vs background? Lanes, sidewalks, infrastructure?</li>
+            </ol>
+        </div>
+        <div class="field">
+            <label for="narrative">Your detailed description <span class="req">*</span>
+                <span class="hint">Be as specific as a police report — colors, sizes, positions, actions</span>
+            </label>
+            <textarea id="narrative" rows="8"
+                placeholder="Example: This is a busy urban intersection captured during bright daylight. In the foreground center, a white medium-sized sedan is stopped at a red traffic light. To its left, a silver SUV is also waiting. A pedestrian in a blue jacket is crossing the road at the designated crossing in the foreground left. In the background right, a large red delivery truck is parked on the pavement. The traffic light overhead is showing red. There are no visible hazards, though the parked truck slightly obstructs the rightmost lane..."></textarea>
+            <div class="word-counter" id="wordCounter">
+                <span><span id="wordCount">0</span> / 40 words minimum</span>
+                <span id="wordStatus" style="color:#888">keep going…</span>
+            </div>
+            <div class="checklist" id="narrativeChecklist">
+                <span class="check-pill" data-keys="intersection,highway,street,road,parking,urban,residential,school,construction" id="pill-scene">📍 Scene type</span>
+                <span class="check-pill" data-keys="car,van,truck,bus,vehicle,suv,sedan,motorcycle" id="pill-vehicles">🚗 Vehicles</span>
+                <span class="check-pill" data-keys="pedestrian,person,people,walker,cyclist,bicycle" id="pill-people">🚶 People</span>
+                <span class="check-pill" data-keys="foreground,background,left,right,center,front,behind" id="pill-position">📐 Positions</span>
+                <span class="check-pill" data-keys="white,black,red,blue,green,yellow,silver,gray,orange,brown" id="pill-colors">🎨 Colors</span>
+                <span class="check-pill" data-keys="traffic light,signal,light" id="pill-lights">🚦 Traffic lights</span>
+                <span class="check-pill" data-keys="hazard,danger,risk,accident,crash,obstruct,block,unusual,emergency" id="pill-hazards">⚠️ Hazards</span>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Objects ── -->
+        <div class="sec-label">Detected objects <span style="font-size:11px;color:var(--ink3);text-transform:none;letter-spacing:0">(minimum 3 required)</span></div>
+        <div class="instruction-box">
+            Add one card per <strong>object type</strong>. Set the count, then fill in details for each individual instance. Click <strong>+ Add object</strong> to add more types.
+        </div>
+
+        <div class="objects-container">
+            <div class="obj-list" id="objList"></div>
+            <button class="btn-add-object" onclick="addObject()">
+                <span style="font-size:16px;line-height:1">+</span> Add object
+            </button>
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Hazards (always shown) ── -->
+        <div class="sec-label" style="margin-top:0">Safety & hazards</div>
+        <div class="field">
+            <label for="f_hazards_yn">Are there any hazardous events or safety concerns? <span class="req">*</span></label>
+            <select id="f_hazards_yn" required onchange="toggleHazardsDescription()">
+                <option value="">— select —</option>
+                <option value="no">No — scene appears safe</option>
+                <option value="yes">Yes — there are hazards or concerns</option>
+            </select>
+        </div>
+        <div id="hazardsDescriptionField" style="display:none">
+            <div class="field">
+                <label for="f_hazards">Describe the hazards or safety concerns <span class="req">*</span>
+                    <span class="hint">What hazards? Where? Who is at risk?</span>
+                </label>
+                <textarea id="f_hazards" rows="3" placeholder="Describe any hazards, unusual events, obstacles, or dangerous situations in detail..."></textarea>
+            </div>
+        </div>
+
+        <div id="videoOnlyFields" style="display:none">
+            <hr class="divider">
+            <div class="sec-label">Video-specific observations</div>
+            <div class="field">
+                <label for="f_traffic_behavior">Describe the traffic flow and vehicle behavior <span class="req">*</span>
+                    <span class="hint">Smooth flow? Congestion? Speed patterns? Lane changes? Conflicts?</span>
+                </label>
+                <textarea id="f_traffic_behavior" rows="3" placeholder="Describe how traffic flows across the video, any notable vehicle behaviors, interactions, or congestion patterns..."></textarea>
+            </div>
+            <div class="field">
+                <label for="f_events_over_time">Describe any events that change over time <span class="hint">(optional)</span></label>
+                <textarea id="f_events_over_time" rows="2" placeholder="e.g. A car enters from the left at 3s and stops at the junction. Pedestrians begin crossing at 7s..."></textarea>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Submit ── -->
+        <div class="btn-row">
+            <button class="btn btn-primary" id="submitBtn" onclick="submitForm()" disabled>
+                Submit annotation
+            </button>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <!-- ── Done ── -->
+        <div class="done" id="done">
+            <div class="done-check">
+                <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+            <h2>Annotation submitted</h2>
+            <p id="doneMsg">Your responses have been saved.</p>
+        </div>
+    </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// QUESTION CONFIG SCHEMA
+// Add new object types or questions here — no HTML changes needed.
+// ═══════════════════════════════════════════════════════════════
+
+const OBJECT_CLASSES = [
+    { value: '',             label: '— select type —' },
+    { value: 'car',          label: 'Car' },
+    { value: 'van',          label: 'Van' },
+    { value: 'truck',        label: 'Truck' },
+    { value: 'bus',          label: 'Bus' },
+    { value: 'motorcycle',   label: 'Motorcycle' },
+    { value: 'cyclist',      label: 'Cyclist' },
+    { value: 'pedestrian',   label: 'Pedestrian' },
+    { value: 'traffic_light',label: 'Traffic Light' },
+    { value: 'road_sign',    label: 'Road Sign' },
+    { value: 'other',        label: 'Other' },
+];
+
+// Fields per object instance — keyed by type
+// Keys: id, label, type (select|text|radio), options, required, condition
+// condition(type) → bool: whether this field applies
+const INSTANCE_FIELDS = {
+    // ── Always-present fields ──
+    _always: [
+        {
+            id: 'position', label: 'Position in frame', type: 'select', required: true,
+            options: ['Foreground Left','Foreground Center','Foreground Right',
+                      'Midground Left','Midground Center','Midground Right',
+                      'Background Left','Background Center','Background Right']
+        },
+        {
+            id: 'action', label: 'Action / behavior', type: 'select', required: false,
+            options: ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'],
+            condition: t => !['traffic_light','road_sign','other'].includes(t)
+        },
+    ],
+
+    // ── Vehicles (car, van, truck, bus, motorcycle) ──
+    _vehicle: {
+        applies: t => ['car','van','truck','bus','motorcycle'].includes(t),
+        fields: [
+            {
+                id: 'color', label: 'Vehicle color', type: 'select', required: true,
+                options: ['white','black','silver','gray','red','blue','green','yellow','orange','brown','beige','mixed / two-tone']
+            },
+            {
+                id: 'size', label: 'Vehicle size', type: 'select', required: true,
+                options: ['small (e.g. hatchback)','medium (e.g. sedan/SUV)','large (e.g. truck/bus)']
+            },
+            {
+                id: 'direction', label: 'Direction of travel', type: 'select', required: false,
+                options: ['towards camera','away from camera','left to right','right to left','stationary','unclear']
+            },
+            {
+                id: 'lane_position', label: 'Lane / road position', type: 'select', required: false,
+                options: ['left lane','center lane','right lane','parking bay','unclear']
+            },
+            {
+                id: 'extra', label: 'Additional details', type: 'text', required: false,
+                placeholder: 'e.g. delivery markings, roof rack, towing, registration visible...',
+                fullWidth: true
+            },
+        ]
+    },
+
+    // ── Pedestrian ──
+    _pedestrian: {
+        applies: t => t === 'pedestrian',
+        fields: [
+            {
+                id: 'age_group', label: 'Approximate age group', type: 'select', required: false,
+                options: ['child','teenager','adult','elderly','unclear']
+            },
+            {
+                id: 'looking_at_traffic', label: 'Attending to traffic?', type: 'select', required: false,
+                options: ['yes','no — distracted (phone etc.)','unclear']
+            },
+            {
+                id: 'extra', label: 'Additional details', type: 'text', required: false,
+                placeholder: 'e.g. clothing color, group size, mobility aid...',
+                fullWidth: true
+            },
+        ]
+    },
+
+    // ── Cyclist ──
+    _cyclist: {
+        applies: t => t === 'cyclist',
+        fields: [
+            {
+                id: 'lane_use', label: 'Using cycle lane?', type: 'select', required: false,
+                options: ['yes — in cycle lane','no — in traffic lane','pavement (illegal)','no cycle lane present','unclear']
+            },
+            {
+                id: 'direction', label: 'Direction of travel', type: 'select', required: false,
+                options: ['towards camera','away from camera','left to right','right to left','stationary']
+            },
+            {
+                id: 'extra', label: 'Additional details', type: 'text', required: false,
+                placeholder: 'e.g. cargo bike, e-bike, visibility vest...',
+                fullWidth: true
+            },
+        ]
+    },
+
+    // ── Traffic Light ──
+    _traffic_light: {
+        applies: t => t === 'traffic_light',
+        fields: [
+            {
+                id: 'signal_state', label: 'Signal state showing', type: 'select', required: true,
+                options: ['green','yellow / amber','red','off / dark','unclear']
+            },
+            {
+                id: 'visibility', label: 'Signal visibility', type: 'select', required: false,
+                options: ['fully visible','partially occluded','sun glare on lens','obscured','unclear']
+            },
+            {
+                id: 'compliance', label: 'Are road users complying?', type: 'select', required: false,
+                options: ['yes — all stopped at red','yes — all moving on green',
+                          'no — vehicle running red','no — pedestrian crossing on red',
+                          'mixed','not applicable / cannot tell']
+            },
+        ]
+    },
+
+    // ── Road Sign ──
+    _road_sign: {
+        applies: t => t === 'road_sign',
+        fields: [
+            {
+                id: 'sign_type', label: 'Sign type', type: 'select', required: true,
+                options: ['speed limit','stop','give way / yield','no entry','one way',
+                          'warning / hazard','pedestrian crossing','school zone',
+                          'road works','direction / wayfinding','other']
+            },
+            {
+                id: 'sign_value', label: 'Sign value / text', type: 'text', required: false,
+                placeholder: 'e.g. "30", "STOP", "School 20mph zone"'
+            },
+            {
+                id: 'visibility', label: 'Sign visibility', type: 'select', required: false,
+                options: ['fully visible','partially occluded','damaged','unclear']
+            },
+        ]
+    },
+
+    // ── Other ──
+    _other: {
+        applies: t => t === 'other',
+        fields: [
+            {
+                id: 'description', label: 'Describe the object', type: 'text', required: true,
+                placeholder: 'What is this object?', fullWidth: true
+            },
+        ]
+    },
+};
+
+// Scene-level conditional questions removed per design decision —
+// hazards/safety covered in dedicated section; scene layout redundant with narrative.
+const SCENE_QUESTIONS = [];
+
+// ═══════════════════════════════════════════════════════════════
+// RUNTIME
+// ═══════════════════════════════════════════════════════════════
+
+const SCENE_ID = new URLSearchParams(location.search).get('scene_id') || 'static';
+
+document.getElementById('sceneIdLabel').textContent = 'scene: ' + SCENE_ID;
+
+// Load media (video preferred, fallback to image)
+(async () => {
+    const c = document.getElementById('imgContainer');
+    try {
+        const rv = await fetch('/api/scene-video?scene_id=' + encodeURIComponent(SCENE_ID));
+        const dv = await rv.json();
+        if (dv && dv.url) {
+            // Render HTML5 video player with replay button
+            c.innerHTML = `
+                <div style="position:relative">
+                    <video id="sceneVideo" class="scene-img" controls playsinline>
+                        <source src="${dv.url}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                    <button id="replayBtn" style="position:absolute;right:12px;bottom:12px;padding:8px 10px;border-radius:8px;border:none;background:rgba(0,0,0,0.6);color:#fff;cursor:pointer">Replay</button>
+                </div>`;
+            document.getElementById('replayBtn').addEventListener('click', function(){
+                const v = document.getElementById('sceneVideo');
+                if (v) { v.currentTime = 0; v.play(); }
+            });
+            // Show video-specific fields
+            const vf = document.getElementById('videoOnlyFields'); if (vf) vf.style.display = 'block';
+            // Update badge to indicate this is a video scene
+            document.getElementById('sceneIdLabel').textContent = 'scene: video';
+            return;
+        }
+    } catch (e) {
+        console.warn('Video preview not available', e);
+    }
+
+    // Fallback to image
+    try {
+        const r = await fetch('/api/scene-image?scene_id=' + encodeURIComponent(SCENE_ID));
+        const d = await r.json();
+        if (d.b64) {
+            c.innerHTML = `<img class="scene-img" src="data:image/jpeg;base64,${d.b64}" alt="Scene to annotate">`;
+        } else {
+            c.innerHTML = `<div class="no-img">No image found for scene "${SCENE_ID}"</div>`;
+        }
+    } catch {
+        c.innerHTML = `<div class="no-img">Could not load media</div>`;
+    }
+})();
+
+// ── Word counter + checklist ──
+document.getElementById('narrative').addEventListener('input', updateWordCount);
+
+function updateWordCount() {
+    const text   = document.getElementById('narrative').value;
+    const words  = text.trim() ? text.trim().split(/\s+/).length : 0;
+    const lower  = text.toLowerCase();
+    document.getElementById('wordCount').textContent = words;
+
+    const counter  = document.getElementById('wordCounter');
+    const statusEl = document.getElementById('wordStatus');
+    if (words < 40) {
+        counter.className   = 'word-counter warning';
+        statusEl.textContent = `${40 - words} more words needed`;
+        statusEl.style.color = 'var(--warn)';
+    } else {
+        counter.className   = 'word-counter ok';
+        statusEl.textContent = '✓ minimum met';
+        statusEl.style.color = 'var(--ok)';
+    }
+
+    // Update checklist pills
+    document.querySelectorAll('.check-pill').forEach(pill => {
+        const keys = pill.dataset.keys.split(',');
+        const found = keys.some(k => lower.includes(k.trim()));
+        pill.classList.toggle('found', found);
+    });
+}
+
+// ── Object management ──
+let objectCount = 0;
+
+function getFormState() {
+    // Collect current form state for conditional rendering
+    const objectTypes = new Set();
+    const objectActions = new Set();
+    document.querySelectorAll('.obj-card').forEach(card => {
+        const id   = card.id;
+        const type = document.getElementById(id + '_type')?.value;
+        if (type) objectTypes.add(type);
+        // check instance actions
+        card.querySelectorAll('select[id$="_action"]').forEach(sel => {
+            if (sel.value) objectActions.add(sel.value);
+        });
+    });
+    return {
+        environment:          document.getElementById('f_environment').value,
+        lighting:             document.getElementById('f_lighting').value,
+        weather:              document.getElementById('f_weather').value,
+        traffic_density:      document.getElementById('f_traffic_density').value,
+        hasType_traffic_light: objectTypes.has('traffic_light'),
+        hasType_pedestrian:    objectTypes.has('pedestrian'),
+        hasType_cyclist:       objectTypes.has('cyclist'),
+        hasAction_parked:      [...objectActions].some(a => a.includes('parked')),
+    };
+}
+
+function renderConditionalQuestions() {
+    const state   = getFormState();
+    const block   = document.getElementById('conditionalSceneBlock');
+    const active  = SCENE_QUESTIONS.filter(q => q.trigger(state));
+
+    if (active.length === 0) { block.innerHTML = ''; return; }
+
+    // Group by tag
+    const byTag = {};
+    active.forEach(q => {
+        if (!byTag[q.tag]) byTag[q.tag] = [];
+        byTag[q.tag].push(q);
+    });
+
+    let html = `<div class="sec-label">Scene context questions</div>`;
+
+    Object.entries(byTag).forEach(([tag, qs]) => {
+        html += `<div class="conditional-section">
+            <div class="sec-label" style="font-size:10px;margin-bottom:10px">${tag}</div>`;
+
+        qs.forEach(q => {
+            const reqMark = q.required ? '<span class="req">*</span>' : '';
+            html += `<div class="conditional-q">
+                <div class="q-label">
+                    <span class="q-tag">${tag}</span>
+                    ${q.label} ${reqMark}
+                </div>`;
+
+            if (q.type === 'select') {
+                // Preserve existing value if re-rendering
+                const existing = document.getElementById(q.id)?.value || '';
+                html += `<select id="${q.id}" ${q.required ? 'required' : ''} style="font-size:13px">
+                    <option value="">— select —</option>
+                    ${q.options.map(o => `<option value="${o}" ${existing===o?'selected':''}>${o}</option>`).join('')}
+                </select>`;
+            } else {
+                const existing = document.getElementById(q.id)?.value || '';
+                html += `<input type="text" id="${q.id}" 
+                    placeholder="${q.placeholder || ''}"
+                    value="${existing}"
+                    style="font-size:13px" ${q.required ? 'required' : ''}>`;
+            }
+
+            html += `</div>`;
+        });
+
+        html += `</div>`;
+    });
+
+    block.innerHTML = html;
+}
+
+function addObject() {
+    const list  = document.getElementById('objList');
+    const count = list.querySelectorAll('.obj-card').length;
+    if (count >= 20) { showStatus('Maximum 20 objects allowed.', 'warn'); return; }
+
+    objectCount++;
+    const objId    = 'obj_' + objectCount;
+    const isMandatory = count < 3;  // first 3 cards cannot be removed
+    const card  = document.createElement('div');
+    card.className = 'obj-card';
+    card.id = objId;
+
+    card.innerHTML = `
+        <div class="obj-card-header">
+            <span class="obj-card-num">Object ${count + 1}${isMandatory ? ' <span style="font-size:10px;opacity:.6;font-weight:400;letter-spacing:0;text-transform:none">(required)</span>' : ''}</span>
+            ${isMandatory ? '' : `<button class="obj-card-remove" onclick="removeObject('${objId}')" title="Remove">✕</button>`}
+        </div>
+        <div class="obj-top-row">
+            <div class="field" style="margin-bottom:0">
+                <label for="${objId}_type">Object type <span class="req">*</span></label>
+                <select id="${objId}_type" required onchange="updateInstanceFields('${objId}')">
+                    ${OBJECT_CLASSES.map(c => `<option value="${c.value}">${c.label}</option>`).join('')}
+                </select>
+            </div>
+            <div class="field" style="margin-bottom:0">
+                <label for="${objId}_count">Count <span class="req">*</span>
+                    <span class="hint">How many of this type?</span>
+                </label>
+                <input type="number" id="${objId}_count" min="1" max="10" value="1" required
+                    onchange="updateInstanceFields('${objId}')">
+            </div>
+        </div>
+        <div id="${objId}_instances"></div>
+    `;
+
+    list.appendChild(card);
+    updateInstanceFields(objId);
+    validateObjectCount();
+}
+
+function removeObject(objId) {
+    document.getElementById(objId)?.remove();
+    validateObjectCount();
+}
+
+function updateInstanceFields(objId) {
+    const type     = document.getElementById(objId + '_type').value;
+    const rawCount = parseInt(document.getElementById(objId + '_count').value) || 1;
+    const count    = Math.min(Math.max(rawCount, 1), 10);
+    const container = document.getElementById(objId + '_instances');
+
+    if (!type) { container.innerHTML = ''; return; }
+
+    // Find applicable field groups
+    const fieldGroups = [];
+    fieldGroups.push({ fields: INSTANCE_FIELDS._always.filter(f => !f.condition || f.condition(type)) });
+    Object.values(INSTANCE_FIELDS).forEach(group => {
+        if (group && group.applies && group.applies(type)) {
+            fieldGroups.push(group);
+        }
+    });
+
+    container.innerHTML = '';
+
+    for (let i = 1; i <= count; i++) {
+        const fid   = `${objId}_item_${i}`;
+        const block = document.createElement('div');
+        block.className = 'instance-block';
+
+        const title = document.createElement('div');
+        title.className = 'instance-title';
+        title.textContent = count === 1
+            ? `Details for this ${type.replace('_', ' ')}`
+            : `${type.replace('_', ' ')} #${i} details`;
+        block.appendChild(title);
+
+        const grid = document.createElement('div');
+        grid.className = 'instance-fields';
+
+        fieldGroups.forEach(group => {
+            group.fields.forEach(f => {
+                const fieldDiv = document.createElement('div');
+                fieldDiv.className = 'field' + (f.fullWidth ? ' full-width' : '');
+
+                const reqStr = f.required ? '<span class="req">*</span>' : '';
+                fieldDiv.innerHTML = `<label for="${fid}_${f.id}">${f.label} ${reqStr}</label>`;
+
+                if (f.type === 'select') {
+                    const sel = document.createElement('select');
+                    sel.id = `${fid}_${f.id}`;
+                    if (f.required) sel.required = true;
+                    sel.innerHTML = `<option value="">— select —</option>` +
+                        f.options.map(o => `<option value="${o}">${o}</option>`).join('');
+                    fieldDiv.appendChild(sel);
+                } else {
+                    const inp = document.createElement('input');
+                    inp.type  = 'text';
+                    inp.id    = `${fid}_${f.id}`;
+                    inp.placeholder = f.placeholder || '';
+                    if (f.required) inp.required = true;
+                    fieldDiv.appendChild(inp);
+                }
+
+                grid.appendChild(fieldDiv);
+            });
+        });
+
+        block.appendChild(grid);
+        container.appendChild(block);
+    }
+}
+
+function validateObjectCount() {
+    const count = document.getElementById('objList').querySelectorAll('.obj-card').length;
+    document.getElementById('submitBtn').disabled = count < 3;
+}
+
+// Initialize with 3 default object cards
+for (let i = 0; i < 3; i++) addObject();
+
+// ── Hazards toggle ──
+function toggleHazardsDescription() {
+    const yn   = document.getElementById('f_hazards_yn').value;
+    const field = document.getElementById('hazardsDescriptionField');
+    const ta   = document.getElementById('f_hazards');
+    if (yn === 'yes') {
+        field.style.display = 'block';
+        ta.required = true;
+    } else {
+        field.style.display = 'none';
+        ta.required = false;
+        ta.value = '';
+    }
+}
+
+// ── Data collection ──
+function collectMCQ() {
+    return {
+        environment:    document.getElementById('f_environment').value,
+        lighting:       document.getElementById('f_lighting').value,
+        traffic_density:document.getElementById('f_traffic_density').value,
+        traffic_flow:   document.getElementById('f_traffic_flow').value,
+    };
+}
+
+function collectObjects() {
+    const objects = [];
+    document.querySelectorAll('.obj-card').forEach(card => {
+        const objId = card.id;
+        const type  = document.getElementById(objId + '_type').value;
+        const count = parseInt(document.getElementById(objId + '_count').value) || 1;
+        if (!type) return;
+
+        for (let i = 1; i <= count; i++) {
+            const fid = `${objId}_item_${i}`;
+            const instance = { instance_id: fid, object_type: type };
+            // Collect all rendered fields for this instance
+            card.querySelectorAll(`[id^="${fid}_"]`).forEach(el => {
+                const key = el.id.replace(fid + '_', '');
+                instance[key] = el.value || null;
+            });
+            objects.push(instance);
+        }
+    });
+    return objects;
+}
+
+function collectSceneContext() {
+    const answers = {};
+    SCENE_QUESTIONS.forEach(q => {
+        const el = document.getElementById(q.id);
+        if (el && el.value) answers[q.id] = el.value;
+    });
+    return answers;
+}
+
+// ── Submit ──
+async function submitForm() {
+    const participantId = document.getElementById('participantId').value.trim();
+    const narrative     = document.getElementById('narrative').value.trim();
+    const hazardsYN     = document.getElementById('f_hazards_yn').value;
+
+    if (!participantId) { showStatus('Please enter your name.', 'warn'); return; }
+
+    const wordCount = narrative ? narrative.split(/\s+/).filter(w => w).length : 0;
+    if (wordCount < 40) { showStatus(`Please write at least 40 words in your description (currently ${wordCount}).`, 'warn'); return; }
+    // Reject keyword dumps: require at least 2 proper sentences (avg ≥6 words each)
+    const sentenceCount = (narrative.match(/[.!?]+(\s|$)/g) || []).length;
+    const avgWordsPerSentence = sentenceCount > 0 ? wordCount / sentenceCount : 0;
+    if (sentenceCount < 2 || avgWordsPerSentence < 6) {
+        showStatus('Please write in full, descriptive sentences — not a list of keywords. Describe the scene as if explaining it to someone who cannot see it.', 'warn'); return;
+    }
+
+    const env     = document.getElementById('f_environment').value;
+    const lighting = document.getElementById('f_lighting').value;
+    if (!env || !lighting) { showStatus('Please fill in the required scene conditions (Environment, Lighting).', 'warn'); return; }
+
+    if (!hazardsYN) { showStatus('Please indicate whether there are hazards.', 'warn'); return; }
+    if (hazardsYN === 'yes' && !document.getElementById('f_hazards').value.trim()) {
+        showStatus('Please describe the hazards.', 'warn'); return;
+    }
+
+    if (isVideo && !document.getElementById('f_traffic_behavior').value.trim()) {
+        showStatus('Please describe the traffic flow for this video.', 'warn'); return;
+    }
+
+    const objects = collectObjects();
+    if (objects.length < 3) { showStatus('Please provide details for at least 3 objects.', 'warn'); return; }
+
+    // Check required instance fields
+    let missingReq = 0;
+    objects.forEach(obj => {
+        if (!obj.position) missingReq++;
+        if (['car','van','truck','bus','motorcycle'].includes(obj.object_type)) {
+            if (!obj.color || !obj.size) missingReq++;
+        }
+        if (obj.object_type === 'traffic_light' && !obj.signal_state) missingReq++;
+        if (obj.object_type === 'road_sign' && !obj.sign_type) missingReq++;
+    });
+    if (missingReq > 0) { showStatus(`Please complete all required fields in the objects section (${missingReq} field(s) missing).`, 'warn'); return; }
+
+    // Submit
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin"></span> Saving…';
+    showStatus('Submitting your annotation…', 'info');
+
+    try {
+        const payload = {
+            scene_id:       SCENE_ID,
+            participant_id: participantId,
+            narrative:      narrative,
+            scene_fields:   collectMCQ(),
+            objects:        objects,
+            scene_context:  collectSceneContext(),
+            hazards_yn:     hazardsYN,
+            hazards_and_events: hazardsYN === 'yes' ? document.getElementById('f_hazards').value.trim() : 'none',
+        };
+
+        if (isVideo) {
+            payload.traffic_behavior    = document.getElementById('f_traffic_behavior').value.trim();
+            payload.events_over_time    = document.getElementById('f_events_over_time').value.trim();
+        }
+
+        const r = await fetch('/api/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const d = await r.json();
+        if (d.error) {
+            showStatus('Error: ' + d.error, 'err');
+            btn.disabled = false;
+            btn.innerHTML = 'Submit annotation';
+            return;
+        }
+
+        document.getElementById('mainBody').style.opacity = '.3';
+        document.getElementById('mainBody').style.pointerEvents = 'none';
+        btn.innerHTML = '✓ Submitted';
+        document.getElementById('doneMsg').textContent =
+            d.sheets ? 'Saved to Google Sheets and local backup.' : 'Saved locally.';
+        document.getElementById('done').classList.add('on');
+        showStatus('', '');
+
+    } catch (e) {
+        showStatus('Submission error: ' + e.message, 'err');
+        btn.disabled = false;
+        btn.innerHTML = 'Submit annotation';
+    }
+}
+
+function showStatus(msg, type) {
+    const el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = 'status' + (msg ? ' ' + type : '');
+}
+</script>
+</body>
+</html>
