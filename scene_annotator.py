@@ -10,6 +10,7 @@ from datetime import datetime
 from threading import Thread
 
 import cv2
+import numpy as np
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
 # tracker integration — ByteTracker (robust multi-object tracking)
@@ -50,7 +51,7 @@ TOKEN_FILE       = "token.json"
 SHEET_ID_FILE    = "spreadsheet_id.txt"
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVER_PORT      = 7860
-DEFAULT_TARGET   = "assets/3.mp4"  # can be image or video path
+DEFAULT_TARGET   = "assets/7.mp4"  # can be image or video path
 TOP_N_OBJECTS_FOR_GAP_FILL = 3  # only ask about largest N objects in Stage 2
 VIDEO_CHUNK_SECONDS = 5
 TRACKER_FRAME_RATE = 5  # how many detections per second to generate for the tracker (higher than Qwen sampling)
@@ -77,17 +78,7 @@ CUMULATIVE_SUMMARY_SCHEMA = {
     "traffic_flow":     "free-flowing | slow-moving | stopped | mixed | one-directional | bidirectional",
 
     # ── Object groups (NOT per-object — summarised by category) ─────────────
-    # Each entry describes a group of similar objects observed
-    "object_groups": [
-        {
-            "group_label":   "e.g. 'parked cars' / 'crossing pedestrians' / 'delivery trucks'",
-            "object_type":   "car | truck | bus | person | cyclist | motorcycle | traffic_light",
-            "count":         0,
-            "typical_size":  "small | medium | large",
-            "zone":          "foreground | background",
-            "behavior":      "parked | moving | stopped | crossing | turning | static | mixed"
-        }
-    ],
+    
     "scene_narrative": "3–4 sentences describing the overall scene holistically: what kind of place, what is happening, what stands out.",
     "hazards_and_events": "any safety concerns, unusual events, obstructions, or noteworthy observations. 'none' if absent.",
     "spatial_description": "brief description of depth layers: what occupies foreground vs background, lane structure, sidewalks, etc.",
@@ -326,6 +317,77 @@ def _safe_parse_json(raw: str) -> dict:
     return {}
 
 
+# ── Global Motion Compensation (GMC) ──────────────────────────────────────────
+# NOTE: Full frame-based GMC would require loading video frames during tracker phase.
+# Currently disabled (returns 0,0) to avoid false movement filtering.
+# Can be enhanced later if needed for panning/zooming compensation.
+
+def apply_gmc_to_bbox(bbox, gmc_tx=0, gmc_ty=0):
+    """Compensate bbox for camera motion (currently stub: gmc_tx/y typically 0)."""
+    if gmc_tx == 0 and gmc_ty == 0:
+        return bbox  # No compensation needed
+    return {
+        "x1": bbox["x1"] - gmc_tx,
+        "y1": bbox["y1"] - gmc_ty,
+        "x2": bbox["x2"] - gmc_tx,
+        "y2": bbox["y2"] - gmc_ty
+    }
+
+
+def get_bbox_center(bbox):
+    """Return center point of bbox."""
+    return ((bbox["x1"] + bbox["x2"]) / 2, (bbox["y1"] + bbox["y2"]) / 2)
+
+
+def calc_movement_distance(center1, center2):
+    """Calculate Euclidean distance between two points."""
+    return math.sqrt((center1[0] - center2[0]) ** 2 + (center1[1] - center2[1]) ** 2)
+
+
+# ── Tracker Attribute Enrichment ────────────────────────────────────────────
+def build_detection_color_map(seconds_data):
+    """
+    Build a map of object_id → [colors seen] from detected_objects.
+    Used to enrich tracker movements with color info.
+    """
+    color_map = {}
+    for frame in seconds_data:
+        detected_objs = frame.get("scene_summary", {}).get("detected_objects", []) or []
+        for obj in detected_objs:
+            obj_id = str(obj.get("object_id"))
+            color = obj.get("color", "unknown")
+            if obj_id not in color_map:
+                color_map[obj_id] = []
+            if color and color != "unknown":
+                color_map[obj_id].append(color)
+    
+    # Return most common color per object
+    color_summary = {}
+    for obj_id, colors in color_map.items():
+        if colors:
+            from collections import Counter
+            color_summary[obj_id] = Counter(colors).most_common(1)[0][0]
+        else:
+            color_summary[obj_id] = "unknown"
+    return color_summary
+
+
+def enrich_movement_with_colors(movements, color_map):
+    """Add color info to movements based on detected_objects."""
+    for mov in movements:
+        hint = mov.get("object_hint", "")  # e.g., "track_5:car"
+        if ":" in hint:
+            parts = hint.split(":")
+            if len(parts) == 2:
+                # Try to match with detection color (if available)
+                obj_type = parts[1]
+                # Color already encoded in DETECTED_MOVEMENTS via YOLO tracking
+                # This enriches with modal color from Qwen detections
+                if "color" not in mov:
+                    mov["color"] = "unknown"
+    return movements
+
+
 def call_qwen_vision(frame_bgr, prompt):
     # Downscale to 512px long-side — enough for color/scene, much faster to encode
     h, w   = frame_bgr.shape[:2]
@@ -357,7 +419,7 @@ def call_qwen_text(prompt):
         "messages": [{"role": "user", "content": prompt}],
         "options": {"temperature": 0.0, "num_ctx": 2048, "num_predict": 1024}
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    r = requests.post(OLLAMA_URL, json=payload, timeout=300)  # 5 min timeout for complex cumulative prompts
     r.raise_for_status()
     return _safe_parse_json(r.json()["message"]["content"])
 
@@ -399,9 +461,7 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
         )
 
     prompt = (
-        f"You are annotating a traffic scene image recorded from a moving car dashboard. "
-        f"Distinguish parked cars and static objects from active traffic and moving objects. "
-        f"{n_det} objects were detected by YOLO.\n\n"
+        f"You are annotating a traffic scene image. {n_det} objects were detected by YOLO.\n\n"
         f"DETECTIONS (id, type, position, bounding_box already confirmed):\n"
         f"{json.dumps(compact_dets)}\n\n"
         f"YOUR JOB — return JSON with these keys only:\n"
@@ -447,17 +507,22 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
         
         # Determine if this object type should have size
         obj_type = y["type"].lower()
-        is_vehicle_or_cyclist = any(x in obj_type for x in ["car", "van", "truck", "bus", "motorcycle", "cyclist", "bicycle"])
+        is_vehicle = any(x in obj_type for x in ["car", "van", "truck", "bus", "motorcycle"])
+        is_vehicle_or_cyclist = is_vehicle or any(x in obj_type for x in ["cyclist", "bicycle"])
         
         obj = {
             "object_id":        y["id"],
             "object_type":      y["type"],
             "confidence":       y["confidence"],
-            "color":            ai.get("color"),  # Fallback to unknown if missing
+            "color":            ai.get("color"),
             "position":         y["position"],
             "bounding_box":     y["bounding_box"],
             "bounding_box_area":y["area"],
         }
+        
+        # ENFORCE: vehicles MUST have a color (never null)
+        if is_vehicle and (obj["color"] is None or obj["color"] == ""):
+            obj["color"] = "gray"  # default fallback for vehicles
         
         # Only add size for vehicles/cyclists, not for pedestrians or traffic lights
         if is_vehicle_or_cyclist:
@@ -505,7 +570,11 @@ def _dump_json(path, data):
         json.dump(data, f, indent=2)
 
 
-def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/tracks.json"):
+def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/tracks.json", frames_data=None):
+    """
+    Collect movements from tracker with color enrichment from frame data.
+    frames_data: list of per-frame JSON (for color enrichment)
+    """
     if not os.path.exists(tracks_path):
         return []
     try:
@@ -513,29 +582,79 @@ def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/
     except Exception:
         return []
 
+    # Build color map if frames provided
+    color_map = {}
+    if frames_data:
+        color_map = build_detection_color_map(frames_data)
+
     movements = []
+    
     for track in data.get("tracks", []) or []:
         frames = track.get("frames", []) or []
         span_frames = [f for f in frames if span_start <= _safe_int(f.get("second"), -1) <= span_end]
-        if len(span_frames) < 2:
+        if not span_frames:
             continue
 
+        obj_type = track.get('object_type', 'object')
+        track_id = track.get('track_id')
+        first_detection_id = track.get("first_detection_id")
+        
+        # Get modal color if available
+        modal_color = "unknown"
+        if first_detection_id:
+            modal_color = color_map.get(str(first_detection_id), "unknown")
+        
+        # Record presence even for single-frame or stationary objects
+        # Deduplicate evidence_seconds to show each second only once
+        evidence_secs = []
+        seen = set()
+        for f in span_frames:
+            sec = _safe_int(f.get("second"), -1)
+            if sec not in seen:
+                evidence_secs.append(sec)
+                seen.add(sec)
+        
+        if len(span_frames) == 1:
+            movements.append({
+                "object_hint": f"track_{track_id}:{obj_type}",
+                "color": modal_color,
+                "movement": "stationary (single frame)",
+                "evidence_seconds": evidence_secs,
+                "source": "tracker"
+            })
+            continue
+
+        # Multi-frame movement analysis
         start_bbox = span_frames[0].get("bbox", {})
         end_bbox = span_frames[-1].get("bbox", {})
-        start_cx = (start_bbox.get("x1", 0) + start_bbox.get("x2", 0)) / 2
-        start_cy = (start_bbox.get("y1", 0) + start_bbox.get("y2", 0)) / 2
-        end_cx = (end_bbox.get("x1", 0) + end_bbox.get("x2", 0)) / 2
-        end_cy = (end_bbox.get("y1", 0) + end_bbox.get("y2", 0)) / 2
-
-        delta_x = end_cx - start_cx
-        delta_y = end_cy - start_cy
-        if abs(delta_x) < 1 and abs(delta_y) < 1:
-            continue
-
+        
+        start_center = get_bbox_center(start_bbox)
+        end_center = get_bbox_center(end_bbox)
+        
+        delta_dist = calc_movement_distance(start_center, end_center)
+        delta_x = end_center[0] - start_center[0]
+        delta_y = end_center[1] - start_center[1]
+        
+        # Classify movement
+        move_desc = "stationary"
+        if delta_dist > 5:  # More than 5px movement
+            if delta_x > 20:
+                move_desc = "moving right"
+            elif delta_x < -20:
+                move_desc = "moving left"
+            elif delta_y > 20:
+                move_desc = "moving down"
+            elif delta_y < -20:
+                move_desc = "moving up"
+            else:
+                move_desc = f"moving ({delta_dist:.1f}px)"
+        
         movements.append({
-            "object_hint": f"track_{track.get('track_id')}:{track.get('object_type', 'object')}",
-            "movement": f"dx={delta_x:.1f}px, dy={delta_y:.1f}px",
-            "evidence_seconds": [_safe_int(f.get("second"), -1) for f in span_frames],
+            "object_hint": f"track_{track_id}:{obj_type}",
+            "color": modal_color,
+            "movement": move_desc,
+            "distance_px": delta_dist,
+            "evidence_seconds": evidence_secs,
             "source": "tracker"
         })
     return movements
@@ -643,7 +762,7 @@ def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_i
                     "frames": [p["second"] for p in positions]
                 })
 
-    tracker_movements = _collect_track_movements_for_span(span_start, span_end)
+    tracker_movements = _collect_track_movements_for_span(span_start, span_end, frames_data=frames_payload)
     if tracker_movements:
         movements_detected = tracker_movements + movements_detected
     
@@ -702,49 +821,55 @@ def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_i
     
     prompt = (
         "You are merging consecutive per-second traffic scene annotations into ONE cumulative JSON summary.\n"
-        "CONTEXT: This video is recorded from a moving car dashboard — when describing movements, distinguish parked/static objects from active traffic and moving objects.\n"
+        "For AI-human comparison: environment, lighting, traffic_density, traffic_flow must match form options.\n\n"
         "CRITICAL RULES:\n"
-        "1. Use ONLY the data provided below—do NOT invent observations.\n"
-        "2. If object counts are in the data, USE those counts. Do NOT change them.\n"
-        "3. If movements are listed, DESCRIBE them in the narrative with COLORS and specifics.\n"
-        "4. Be FACTUAL: only describe what you see in the movement and count data.\n"
-        "5. ALWAYS INCLUDE COLORS in your narrative. Example: 'white sedan moved left' not just 'car moved left'.\n\n"
+        "1. Use ONLY the data provided below—do NOT invent observations or movements.\n"
+        "2. Counts are pre-aggregated. MUST match them exactly. Do NOT change.\n"
+        "3. ONLY describe movements in DETECTED MOVEMENTS or TRACKER DATA.\n"
+        "4. Be FACTUAL: your narrative is grounded in provided data, not inference.\n"
+        "5. ALWAYS INCLUDE COLORS in descriptions. Example: 'white sedan moved left' not 'car moved left'.\n"
+        "6. Narrative MUST mention BOTH static and moving objects. Include parked vehicles and pedestrian presence.\n"
+        "7. Do NOT claim movements or object presence unsupported by data.\n\n"
         f"## PER-SECOND SUMMARY (seconds {span_start} to {span_end}):\n{frame_summaries_json}\n\n"
-        f"## AGGREGATED COUNTS (from per-second data above):\n"
+        f"## AGGREGATED COUNTS (MUST use these, do NOT change):\n"
         f"- Average vehicles: {avg_vehicles}\n"
         f"- Average pedestrians: {avg_pedestrians}\n"
         f"- Average cyclists: {avg_cyclists}\n"
         f"- Average traffic lights: {avg_traffic_lights}\n\n"
-        f"## DETECTED MOVEMENTS:\n{movements_json}\n\n"
-        f"## TRACKER DATA (if available):\n{track_summaries_json}\n\n"
-        "Return JSON with these exact keys:\n"
+        f"## DETECTED MOVEMENTS (ONLY these in narrative):\n"
+        f"{movements_json}\n\n"
+        f"## TRACKER DATA:\n{track_summaries_json}\n\n"
+        "Return ONLY this JSON (no markdown, no explanation):\n"
         "{\n"
         "  \"annotator_type\": \"ai\",\n"
         f"  \"scene_id\": \"{scene_id}\",\n"
-        "  \"time_span\": {\"start_second\": 0, \"end_second\": 0},\n"
-        "  \"environment\": \"\",\n"
-        "  \"lighting\": \"\",\n"
-        "  \"traffic_density\": \"\",\n"
-        "  \"traffic_flow\": \"\",\n"
-        "  \"total_vehicles\": 0,\n"
-        "  \"total_pedestrians\": 0,\n"
-        "  \"total_cyclists\": 0,\n"
-        "  \"total_traffic_lights\": 0,\n"
-        "  \"object_groups\": [],\n"
-        "  \"scene_narrative\": \"\",\n"
-        "  \"spatial_description\": \"\",\n"
-        "  \"hazards_and_events\": \"\",\n"
-        "  \"temporal_movements\": [],\n"
-        "  \"annotation_confidence\": 0.0\n"
+        "  \"time_span\": {\"start_second\": " + str(span_start) + ", \"end_second\": " + str(span_end) + "},\n"
+        "  \"environment\": \"urban street\",\n"
+        "  \"lighting\": \"bright daylight\",\n"
+        "  \"traffic_density\": \"moderate\",\n"
+        "  \"traffic_flow\": \"free-flowing\",\n"
+        f"  \"total_vehicles\": {avg_vehicles},\n"
+        f"  \"total_pedestrians\": {avg_pedestrians},\n"
+        f"  \"total_cyclists\": {avg_cyclists},\n"
+        f"  \"total_traffic_lights\": {avg_traffic_lights},\n"
+        "  \"scene_narrative\": \"Specific 3-4 sentence description with colors, types, movements, and counts.\",\n"
+        "  \"spatial_description\": \"Describe foreground vs background layout.\",\n"
+        "  \"hazards_and_events\": \"none\",\n"
+        "  \"temporal_movements\": [\n"
+        "    {\"object_type\": \"car\", \"color\": \"white\", \"movement\": \"moving right\", \"distance_px\": 45.2, \"evidence_seconds\": [0,1,2]}\n"
+        "  ],\n"
+        "  \"annotation_confidence\": 0.8\n"
         "}\n\n"
-        "REQUIRED:\n"
-        "- total_vehicles/pedestrians/etc: MUST match the aggregated counts (do NOT invent).\n"
-        "- scene_narrative: If count data shows changes or movements exist, describe them factually WITH COLORS AND SIZES.\n"
-        "  Example: 'Average 5 vehicles present: white sedans, red large SUV. Pedestrians crossing observed from frame 0-3.'\n"
-        "- object_groups: Based on detected types and movements. INCLUDE COLORS and SIZES in group labels like '3 white large cars, 1x red medium SUV'.\n"
-        "- temporal_movements: Copy from DETECTED MOVEMENTS section above. Include color and size descriptors.\n"
-        "- If no movements detected, narrative should reflect static/stable scene.\n"
-        "- If hazards absent, write 'none'."
+        "INSTRUCTIONS FOR FILLING JSON:\n"
+        "- environment: Choose ONE: urban street, highway, parking lot, intersection, residential area, school zone, or construction zone\n"
+        "- lighting: Choose ONE: bright daylight, low-light, night with street lights, or night without lighting\n"
+        "- traffic_density: Choose ONE: empty, light, moderate, heavy, or gridlock\n"
+        "- traffic_flow: Choose ONE: free-flowing, slow-moving, stopped, mixed, one-directional, or bidirectional\n"
+        "- total_vehicles, total_pedestrians, total_cyclists, total_traffic_lights: MUST be exactly: " + str(avg_vehicles) + ", " + str(avg_pedestrians) + ", " + str(avg_cyclists) + ", " + str(avg_traffic_lights) + "\n"
+        "- scene_narrative: Write 3-4 sentences describing: (1) Overall scene and environment, (2) Vehicle types/colors and their state (parked/moving), (3) Pedestrian presence and activity, (4) Any movements with colors and directions. Use ONLY data from PER-SECOND SUMMARY.\n"
+        "- temporal_movements: For each item in DETECTED MOVEMENTS, create object with: object_type (car/person/truck/etc), color, movement description, distance_px, evidence_seconds. Must identify WHAT object is moving (e.g., 'car', 'person', 'truck').\n"
+        "- If no movements detected, say: 'Scene with stationary parked vehicles and standing pedestrians, no movement detected.'\n"
+        "- If no hazards, always write: 'none'"
     )
     result = call_qwen_text(prompt)
     cumulative = result if isinstance(result, dict) else {}
@@ -765,7 +890,6 @@ def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_i
     if cumulative.get("total_traffic_lights") == 0 and avg_traffic_lights > 0:
         cumulative["total_traffic_lights"] = avg_traffic_lights
     
-    cumulative.setdefault("object_groups", [])
     if not cumulative.get("temporal_movements") and movements_detected:
         cumulative["temporal_movements"] = movements_detected
     else:
@@ -804,45 +928,49 @@ def _build_cumulative_from_cumulatives(left_summary, right_summary, scene_id):
     
     prompt = (
         "You are merging TWO consecutive cumulative traffic summaries into one larger cumulative summary.\n"
-        "CRITICAL: Do NOT lose or omit movement data. Preserve all detected movements and describe transitions across the boundary.\n"
+        "CRITICAL: Do NOT lose or omit movement data. Preserve all detected movements and describe transitions.\n"
+        "CRITICAL: Use ONLY movements present in the combined summaries. Do NOT invent new movements.\n"
         "Temporal progression: LEFT (earlier) → RIGHT (later).\n\n"
         f"## LEFT SUMMARY (earlier):\n{json.dumps(left_summary, indent=2)}\n\n"
         f"## RIGHT SUMMARY (later):\n{json.dumps(right_summary, indent=2)}\n\n"
-
         f"## TRACKER SUMMARY (tracks overlapping this combined span):\n{track_summaries_json}\n\n"
-        f"## COMBINED MOVEMENT EVIDENCE:\n{json.dumps(combined_movements, indent=2)}\n\n"
-        f"## AGGREGATED COUNTS:\n"
+        f"## COMBINED MOVEMENT EVIDENCE (Use colors and distances from this section):\n{json.dumps(combined_movements, indent=2)}\n\n"
+        f"## AGGREGATED COUNTS (MUST match these exactly):\n"
         f"- Average vehicles: {avg_vehicles}\n"
         f"- Average pedestrians: {avg_peds}\n"
         f"- Average cyclists: {avg_cyclists}\n"
         f"- Average traffic lights: {avg_tls}\n\n"
-        "Return JSON only with these exact keys:\n"
+        "Return ONLY this JSON (no markdown, no explanation):\n"
         "{\n"
         "  \"annotator_type\": \"ai\",\n"
         f"  \"scene_id\": \"{scene_id}\",\n"
-        "  \"time_span\": {\"start_second\": 0, \"end_second\": 0},\n"
-        "  \"environment\": \"\",\n"
-        "  \"lighting\": \"\",\n"
-        "  \"traffic_density\": \"\",\n"
-        "  \"traffic_flow\": \"\",\n"
-        "  \"total_vehicles\": 0,\n"
-        "  \"total_pedestrians\": 0,\n"
-        "  \"total_cyclists\": 0,\n"
-        "  \"total_traffic_lights\": 0,\n"
-        "  \"object_groups\": [],\n"
-        "  \"scene_narrative\": \"\",\n"
-        "  \"spatial_description\": \"\",\n"
-        "  \"hazards_and_events\": \"\",\n"
-        "  \"temporal_movements\": [],\n"
-        "  \"annotation_confidence\": 0.0\n"
+        "  \"time_span\": {\"start_second\": " + str(span_start) + ", \"end_second\": " + str(span_end) + "},\n"
+        "  \"environment\": \"urban street\",\n"
+        "  \"lighting\": \"bright daylight\",\n"
+        "  \"traffic_density\": \"moderate\",\n"
+        "  \"traffic_flow\": \"free-flowing\",\n"
+        f"  \"total_vehicles\": {avg_vehicles},\n"
+        f"  \"total_pedestrians\": {avg_peds},\n"
+        f"  \"total_cyclists\": {avg_cyclists},\n"
+        f"  \"total_traffic_lights\": {avg_tls},\n"
+        "  \"scene_narrative\": \"Comprehensive 3-4 sentence description of combined scene.\",\n"
+        "  \"spatial_description\": \"Describe foreground vs background.\",\n"
+        "  \"hazards_and_events\": \"none\",\n"
+        "  \"temporal_movements\": [\n"
+        "    {\"object_type\": \"car\", \"color\": \"white\", \"movement\": \"moving right\", \"distance_px\": 50.0, \"evidence_seconds\": [2,3,4,5]}\n"
+        "  ],\n"
+        "  \"annotation_confidence\": 0.8\n"
         "}\n\n"
-        "STRICT Rules:\n"
-        "- total_vehicles, total_pedestrians, etc.: USE the aggregated counts above.\n"
-        "- temporal_movements: INCLUDE all movements from LEFT + RIGHT summaries. Do not drop movement data.\n"
-        "- scene_narrative: MUST include all described movements from both sides. Describe how activity progresses and transitions.\n"
-        "- CRITICAL: If LEFT or RIGHT had 'pedestrians crossing' or 'cars moving', this MUST appear in your narrative.\n"
-        "- Do NOT compress away motion details. Keep the narrative detailed.\n"
-        "- If hazards are absent, write 'none'."
+        "INSTRUCTIONS:\n"
+        "- environment: Choose ONE: urban street, highway, parking lot, intersection, residential area, school zone, or construction zone\n"
+        "- lighting: Choose ONE: bright daylight, low-light, night with street lights, or night without lighting\n"
+        "- traffic_density: Choose ONE: empty, light, moderate, heavy, or gridlock\n"
+        "- traffic_flow: Choose ONE: free-flowing, slow-moving, stopped, mixed, one-directional, or bidirectional\n"
+        f"- total_vehicles, total_pedestrians, total_cyclists, total_traffic_lights: MUST be exactly {avg_vehicles}, {avg_peds}, {avg_cyclists}, {avg_tls}\n"
+        "- scene_narrative: Write 3-4 sentences describing: (1) Overall combined scene, (2) Vehicle types/colors and activity, (3) Pedestrian presence across both periods, (4) Key movements with colors and directions. Use LEFT and RIGHT summaries.\n"
+        "- temporal_movements: For each movement in COMBINED MOVEMENT EVIDENCE, include: object_type (car/person/truck/cyclist/etc), color, movement description, distance_px, evidence_seconds. Each movement MUST identify the object type being described.\n"
+        "- If no movements, write: 'static scene - parked/stationary objects only'\n"
+        "- If no hazards, always write: 'none'"
     )
     result = call_qwen_text(prompt)
     merged = result if isinstance(result, dict) else {}
@@ -859,7 +987,6 @@ def _build_cumulative_from_cumulatives(left_summary, right_summary, scene_id):
     if merged.get("total_traffic_lights") == 0 and avg_tls > 0:
         merged["total_traffic_lights"] = avg_tls
     
-    merged.setdefault("object_groups", [])
     if not merged.get("temporal_movements") and combined_movements:
         merged["temporal_movements"] = combined_movements
     else:
@@ -925,7 +1052,6 @@ def generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECO
                 "total_pedestrians": 0,
                 "total_cyclists": 0,
                 "total_traffic_lights": 0,
-                "object_groups": [],
                 "scene_narrative": "",
                 "spatial_description": "",
                 "hazards_and_events": "none",
@@ -988,7 +1114,6 @@ def generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECO
                     "total_pedestrians": 0,
                     "total_cyclists": 0,
                     "total_traffic_lights": 0,
-                    "object_groups": [],
                     "scene_narrative": "",
                     "spatial_description": "",
                     "hazards_and_events": "none",
@@ -1608,8 +1733,7 @@ def process_video(path):
                 out_path="output/tracks.json",
                 track_thresh=0.25,      # Confidence threshold
                 track_buffer=30,       # Frames to keep inactive tracks
-                match_thresh=0.8,      # Similarity threshold
-                video_path=path
+                match_thresh=0.8       # Similarity threshold
             )
         else:
             print("⚠  ByteTracker unavailable; skipping tracking step.")

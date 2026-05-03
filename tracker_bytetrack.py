@@ -11,7 +11,6 @@ import os
 from typing import List, Dict
 import math
 import numpy as np
-import cv2
 
 try:
     import supervision as sv
@@ -72,7 +71,6 @@ def run_bytetrack(
     track_buffer: int = 15,
     match_thresh: float = 0.5,
     min_box_area: float = 10,
-    video_path: str = None,
 ):
     """
     Run ByteTracker on per-second JSONs to produce deterministic tracks.
@@ -111,20 +109,6 @@ def run_bytetrack(
             raise ValueError("Either num_seconds or num_frames must be provided")
         num_frames = int(num_seconds * frame_rate)
 
-    # If a video path is provided, open it to compute ego-motion per frame
-    cap = None
-    prev_gray = None
-    cam_translations = {}  # frame_idx -> (dx, dy)
-    if video_path:
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"  ! Could not open video: {video_path}")
-                cap = None
-        except Exception as e:
-            print(f"  ! Error opening video for ego-motion: {e}")
-            cap = None
-
     for frame_idx in range(num_frames):
         # Try frame-level JSON (high-freq detections)
         p = os.path.join(per_second_json_dir, f"frame_{frame_idx:06d}.json")
@@ -147,6 +131,7 @@ def run_bytetrack(
         confidences = []
         class_ids = []
         object_types = []
+        det_ids = []  # Properly initialized, not via locals() hack
 
         for det in dets_raw:
             bb = det.get("bounding_box", {}) or {}
@@ -164,18 +149,12 @@ def run_bytetrack(
             boxes.append([bb["x1"], bb["y1"], bb["x2"], bb["y2"]])
             confidences.append(conf)
             class_ids.append(0)  # Default class
-            object_types.append(det.get("object_type", "unknown"))
-            # preserve original detection id if present (support multiple possible keys)
+            # Try object_type first, then type (YOLO uses 'type')
+            obj_type = det.get("object_type") or det.get("type") or "unknown"
+            object_types.append(obj_type)
+            # Preserve original detection id if present (support multiple possible keys)
             det_id = det.get("id", det.get("object_id", det.get("detection_id", None)))
-            det_ids = locals().get('det_ids', [])
             det_ids.append(det_id)
-            locals()['det_ids'] = det_ids
-            # preserve original detection id if present (support multiple possible keys)
-            det_id = det.get("id", det.get("object_id", det.get("detection_id", None)))
-            det_ids = locals().get('det_ids', [])
-            det_ids.append(det_id)
-            # write back to locals so fallback code can access
-            locals()['det_ids'] = det_ids
 
         # Fallback: if no detections in per-second JSON, try raw YOLO file
         if not boxes:
@@ -200,9 +179,7 @@ def run_bytetrack(
                     class_ids.append(0)
                     object_types.append(det.get("type", "unknown"))
                     det_id = det.get("id", det.get("object_id", det.get("detection_id", None)))
-                    det_ids = locals().get('det_ids', [])
                     det_ids.append(det_id)
-                    locals()['det_ids'] = det_ids
 
         # Create sv.Detections object
         if boxes:
@@ -218,31 +195,6 @@ def run_bytetrack(
                 detections.data['detection_id'] = locals().get('det_ids', [])
         else:
             detections = sv.Detections.empty()
-
-        # Estimate ego-motion for this frame if video capture available
-        dx, dy = 0.0, 0.0
-        if cap is not None:
-            # read current frame from video
-            try:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ok, img = cap.read()
-                if ok:
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    if prev_gray is not None:
-                        # compute sparse optical flow and take median translation
-                        pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=1000, qualityLevel=0.01, minDistance=7)
-                        if pts is not None:
-                            next_pts, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, None, winSize=(21,21))
-                            st = st.reshape(-1)
-                            prev_pts = pts.reshape(-1,2)[st==1]
-                            next_pts = next_pts.reshape(-1,2)[st==1]
-                            if len(prev_pts) >= 5:
-                                flows = next_pts - prev_pts
-                                dx, dy = float(np.median(flows[:,0])), float(np.median(flows[:,1]))
-                    prev_gray = gray
-            except Exception:
-                dx, dy = 0.0, 0.0
-        cam_translations[frame_idx] = (dx, dy)
 
         # Update tracker with detections for this frame
         detections = byte_tracker.update_with_detections(detections)
@@ -297,30 +249,19 @@ def run_bytetrack(
                 ay = (a["bbox"]["y1"] + a["bbox"]["y2"]) / 2
                 bx = (b["bbox"]["x1"] + b["bbox"]["x2"]) / 2
                 by = (b["bbox"]["y1"] + b["bbox"]["y2"]) / 2
-                # compute raw object displacement
-                obj_dx = bx - ax
-                obj_dy = by - ay
-
-                # compute cumulative camera translation between the two second timestamps
-                a_sec = int(a.get("second", 0))
-                b_sec = int(b.get("second", a_sec))
-                cam_dx = 0.0
-                cam_dy = 0.0
-                # sum per-frame camera translations if available
-                start_idx = a_sec * frame_rate
-                end_idx = b_sec * frame_rate
-                for fi in range(start_idx, end_idx + 1):
-                    t = cam_translations.get(fi)
-                    if t:
-                        cam_dx += t[0]
-                        cam_dy += t[1]
-
-                rel_dx = obj_dx - cam_dx
-                rel_dy = obj_dy - cam_dy
-                dist = math.hypot(rel_dx, rel_dy)
+                dist = math.hypot(bx - ax, by - ay)
                 dsum += dist
                 count += 1
             avg_speed = dsum / count if count else None
+
+        # Deduplicate frames: keep only the first observation per second
+        seen_seconds = set()
+        deduplicated_frames = []
+        for frame_entry in track.frames:
+            second = frame_entry.get("second")
+            if second not in seen_seconds:
+                deduplicated_frames.append(frame_entry)
+                seen_seconds.add(second)
 
         out_tracks.append({
             "track_id": track.track_id,
@@ -328,10 +269,10 @@ def run_bytetrack(
             "start_second": track.start,
             "end_second": track.end,
             "duration_seconds": track.end - track.start + 1,
-            "frames": track.frames,
+            "frames": deduplicated_frames,
             "first_detection_id": track.detection_ids[0] if getattr(track, 'detection_ids', None) else None,
             "avg_speed_px_per_second": avg_speed,
-            "total_frames_seen": len(track.frames),
+            "total_frames_seen": len(deduplicated_frames),
         })
 
     # Sort by track_id
@@ -371,9 +312,4 @@ def run_simple_tracker_fallback(
 if __name__ == "__main__":
     # Test: process output/ directory
     # default: treat as 10 seconds at 1 fps
-    # when run standalone, try to use default video if present
-    default_video = "assets/3.mp4"
-    if os.path.exists(default_video):
-        run_bytetrack(num_seconds=10, frame_rate=1, video_path=default_video)
-    else:
-        run_bytetrack(num_seconds=10, frame_rate=1)
+    run_bytetrack(num_seconds=10, frame_rate=1)
