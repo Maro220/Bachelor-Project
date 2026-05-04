@@ -13,7 +13,6 @@ import cv2
 import numpy as np
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
-# tracker integration — ByteTracker (robust multi-object tracking)
 try:
     from tracker_bytetrack import run_bytetrack
     TRACKER_AVAILABLE = True
@@ -22,7 +21,6 @@ except Exception as e:
     TRACKER_AVAILABLE = False
     run_bytetrack = None
 
-# ── Optional Google Sheets ───────────────────────────────────────────────────
 try:
     from google.oauth2 import service_account
     from google.oauth2.credentials import Credentials
@@ -41,7 +39,6 @@ except ImportError:
     YOLO_AVAILABLE = False
     print("ultralytics not installed. Skipping YOLO detection.")
 
-# ── Config ───────────────────────────────────────────────────────────────────
 OLLAMA_URL       = "http://localhost:11434/api/chat"
 VISION_MODEL     = "qwen2.5vl:7b"
 TEXT_MODEL       = "qwen2.5:3b"
@@ -51,33 +48,28 @@ TOKEN_FILE       = "token.json"
 SHEET_ID_FILE    = "spreadsheet_id.txt"
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVER_PORT      = 7860
-DEFAULT_TARGET   = "assets/7.mp4"  # can be image or video path
-TOP_N_OBJECTS_FOR_GAP_FILL = 3  # only ask about largest N objects in Stage 2
+DEFAULT_TARGET   = "assets/7.mp4" 
+TOP_N_OBJECTS_FOR_GAP_FILL = 3  
 VIDEO_CHUNK_SECONDS = 5
-TRACKER_FRAME_RATE = 5  # how many detections per second to generate for the tracker (higher than Qwen sampling)
+TRACKER_FRAME_RATE = 5
 
-# ── Shared Cumulative Summary Schema ─────────────────────────────────────────
-# Both AI and Human annotations produce this exact structure.
-# This is the unit of comparison in evaluation.
+
 CUMULATIVE_SUMMARY_SCHEMA = {
     "annotator_type": "ai | human",
     "scene_id": "",
 
-    # ── Scene context ────────────────────────────────────────────────────────
     "environment":    "urban street | highway | parking lot | intersection | residential area | school zone | construction zone",
     "lighting":       "bright daylight | low-light | night with street lights | night without lighting",
 
-    # ── Object counts (ground-truth-anchored for AI, estimated for human) ───
     "total_vehicles":         0,
     "total_pedestrians":      0,
     "total_cyclists":         0,
     "total_traffic_lights":   0,
 
-    # ── Traffic dynamics ─────────────────────────────────────────────────────
     "traffic_density":  "empty | light | moderate | heavy | gridlock",
     "traffic_flow":     "free-flowing | slow-moving | stopped | mixed | one-directional | bidirectional",
 
-    # ── Object groups (NOT per-object — summarised by category) ─────────────
+    # ── Object groups
     
     "scene_narrative": "3–4 sentences describing the overall scene holistically: what kind of place, what is happening, what stands out.",
     "hazards_and_events": "any safety concerns, unusual events, obstructions, or noteworthy observations. 'none' if absent.",
@@ -85,8 +77,8 @@ CUMULATIVE_SUMMARY_SCHEMA = {
     "annotation_confidence": None   # 0.0–1.0 for AI, null for human
 }
 
-# ── Internal per-frame AI schema (more granular, for AI processing only) ─────
-# This is NOT used in the survey — it feeds the cumulative summary above.
+#  Internal per-frame AI schema (for AI processing only) 
+# not used in the survey , it feeds the cumulative summary above.
 STATIC_SCHEMA = {
     "frame": "static",
     "scene_summary": {
@@ -179,7 +171,6 @@ POSITION_OPTIONS      = ["Foreground Left", "Foreground Center", "Foreground Rig
 ACTION_OPTIONS        = ["moving", "parked", "stopped", "turning left", "turning right", "crossing", "static", "unknown"]
 VEHICLE_CLASSES       = {"car", "van", "motorcycle", "bus", "truck"}
 
-# ── Google Sheets columns (in order) ─────────────────────────────────────────
 SHEET_HEADERS = [
     "Annotator Type", "Participant ID", "Scene ID",
     "Environment", "Lighting",
@@ -190,7 +181,6 @@ SHEET_HEADERS = [
     "Object Count Summary"
 ]
 
-# ── YOLO ─────────────────────────────────────────────────────────────────────
 _yolo_model = None
 
 def get_yolo():
@@ -282,7 +272,7 @@ def run_yolo(frame):
     return yolo_data, canvas
 
 
-# ── Qwen helpers ──────────────────────────────────────────────────────────────
+#  Qwen helpers 
 def _safe_parse_json(raw: str) -> dict:
     raw = raw.strip()
     try:
@@ -317,15 +307,14 @@ def _safe_parse_json(raw: str) -> dict:
     return {}
 
 
-# ── Global Motion Compensation (GMC) ──────────────────────────────────────────
-# NOTE: Full frame-based GMC would require loading video frames during tracker phase.
+#  Global Motion Compensation (GMC) 
+#  Full frame-based GMC would require loading video frames during tracker phase.
 # Currently disabled (returns 0,0) to avoid false movement filtering.
-# Can be enhanced later if needed for panning/zooming compensation.
 
 def apply_gmc_to_bbox(bbox, gmc_tx=0, gmc_ty=0):
     """Compensate bbox for camera motion (currently stub: gmc_tx/y typically 0)."""
     if gmc_tx == 0 and gmc_ty == 0:
-        return bbox  # No compensation needed
+        return bbox  
     return {
         "x1": bbox["x1"] - gmc_tx,
         "y1": bbox["y1"] - gmc_ty,
@@ -344,12 +333,7 @@ def calc_movement_distance(center1, center2):
     return math.sqrt((center1[0] - center2[0]) ** 2 + (center1[1] - center2[1]) ** 2)
 
 
-# ── Tracker Attribute Enrichment ────────────────────────────────────────────
 def build_detection_color_map(seconds_data):
-    """
-    Build a map of object_id → [colors seen] from detected_objects.
-    Used to enrich tracker movements with color info.
-    """
     color_map = {}
     for frame in seconds_data:
         detected_objs = frame.get("scene_summary", {}).get("detected_objects", []) or []
@@ -361,7 +345,6 @@ def build_detection_color_map(seconds_data):
             if color and color != "unknown":
                 color_map[obj_id].append(color)
     
-    # Return most common color per object
     color_summary = {}
     for obj_id, colors in color_map.items():
         if colors:
@@ -375,21 +358,19 @@ def build_detection_color_map(seconds_data):
 def enrich_movement_with_colors(movements, color_map):
     """Add color info to movements based on detected_objects."""
     for mov in movements:
-        hint = mov.get("object_hint", "")  # e.g., "track_5:car"
+        hint = mov.get("object_hint", "")  #  "track_5:car"
         if ":" in hint:
             parts = hint.split(":")
             if len(parts) == 2:
                 # Try to match with detection color (if available)
                 obj_type = parts[1]
                 # Color already encoded in DETECTED_MOVEMENTS via YOLO tracking
-                # This enriches with modal color from Qwen detections
                 if "color" not in mov:
                     mov["color"] = "unknown"
     return movements
 
 
 def call_qwen_vision(frame_bgr, prompt):
-    # Downscale to 512px long-side — enough for color/scene, much faster to encode
     h, w   = frame_bgr.shape[:2]
     scale  = min(512 / max(h, w), 1.0)
     small  = cv2.resize(frame_bgr, (int(w * scale), int(h * scale)))
@@ -402,8 +383,8 @@ def call_qwen_vision(frame_bgr, prompt):
         "messages": [{"role": "user", "content": prompt, "images": [b64]}],
         "options": {
             "temperature": 0.1,
-            "num_ctx":     4096,   # was 8192 — smaller context = faster KV cache
-            "num_predict": 2048,   # was 6000 — caps output, avoids runaway generation
+            "num_ctx":     4096,  
+            "num_predict": 2048,   
         }
     }
     r = requests.post(OLLAMA_URL, json=payload, timeout=180)
@@ -419,12 +400,12 @@ def call_qwen_text(prompt):
         "messages": [{"role": "user", "content": prompt}],
         "options": {"temperature": 0.0, "num_ctx": 2048, "num_predict": 1024}
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=300)  # 5 min timeout for complex cumulative prompts
+    r = requests.post(OLLAMA_URL, json=payload, timeout=300)  
     r.raise_for_status()
     return _safe_parse_json(r.json()["message"]["content"])
 
 
-# ── Per-Frame Analysis ────────────────────────────────────────────────────────
+#  Per-Frame Analysis 
 def analyse_frame(frame, scene_id, out_json_path, out_img_path):
     is_static         = (scene_id == "static")
     yolo_data, canvas = run_yolo(frame)
@@ -520,7 +501,6 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
             "bounding_box_area":y["area"],
         }
         
-        # ENFORCE: vehicles MUST have a color (never null)
         if is_vehicle and (obj["color"] is None or obj["color"] == ""):
             obj["color"] = "gray"  # default fallback for vehicles
         
@@ -552,7 +532,7 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
     return result
 
 
-# ── AI Cumulative Summary → CUMULATIVE_SUMMARY_SCHEMA ────────────────────────
+# AI Cumulative Summary
 def _safe_int(value, default=0):
     try:
         return int(value)
@@ -582,7 +562,6 @@ def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/
     except Exception:
         return []
 
-    # Build color map if frames provided
     color_map = {}
     if frames_data:
         color_map = build_detection_color_map(frames_data)
@@ -599,13 +578,10 @@ def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/
         track_id = track.get('track_id')
         first_detection_id = track.get("first_detection_id")
         
-        # Get modal color if available
         modal_color = "unknown"
         if first_detection_id:
             modal_color = color_map.get(str(first_detection_id), "unknown")
         
-        # Record presence even for single-frame or stationary objects
-        # Deduplicate evidence_seconds to show each second only once
         evidence_secs = []
         seen = set()
         for f in span_frames:
@@ -635,9 +611,8 @@ def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/
         delta_x = end_center[0] - start_center[0]
         delta_y = end_center[1] - start_center[1]
         
-        # Classify movement
         move_desc = "stationary"
-        if delta_dist > 5:  # More than 5px movement
+        if delta_dist > 5: 
             if delta_x > 20:
                 move_desc = "moving right"
             elif delta_x < -20:
@@ -1131,7 +1106,6 @@ def generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECO
     final_path = current_nodes[0]["path"]
     final_summary = _load_json(final_path)
 
-    # Backward compatibility with existing consumer path.
     _dump_json("output/output_cumulative_mega.json", final_summary)
     _dump_json("output/output_cumulative.json", final_summary)
 
