@@ -40,9 +40,10 @@
             min-height: 100vh;
             padding: 32px 16px 80px;
             font-size: 15px;
+            overflow-x: hidden;
         }
 
-        .shell { max-width: 860px; margin: 0 auto; }
+        .shell { max-width: 860px; margin: 0 auto; width: 100%; overflow-x: hidden; }
 
         /* ── Header ── */
         .hdr {
@@ -90,7 +91,7 @@
         }
 
         /* ── Field ── */
-        .field { margin-bottom: 16px; }
+        .field { margin-bottom: 16px; min-width: 0; max-width: 100%; }
         .field label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 5px; color: var(--ink); }
         .field label .req { color: #c00; margin-left: 2px; }
         .field label .hint { font-weight: 400; color: var(--ink3); font-size: 12px; margin-left: 6px; }
@@ -100,6 +101,7 @@
             font-family: var(--font); border: 1.5px solid var(--border);
             border-radius: var(--radius); background: var(--surface);
             color: var(--ink); transition: border-color .15s, box-shadow .15s;
+            max-width: 100%; min-width: 0; box-sizing: border-box;
         }
         input:focus, textarea:focus, select:focus {
             outline: none; border-color: var(--accent);
@@ -107,7 +109,7 @@
         }
         .invalid { border-color: var(--err) !important; box-shadow: 0 0 0 3px rgba(181,32,32,.1) !important; }
 
-        textarea { min-height: 130px; resize: vertical; line-height: 1.6; }
+        textarea { min-height: 130px; resize: vertical; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
 
         /* ── Word counter ── */
         .word-counter { font-size: 12px; color: var(--ink3); margin-top: 5px; display: flex; justify-content: space-between; align-items: center; }
@@ -275,6 +277,101 @@
 
         /* hazard field */
         #hazardsDescriptionField, #videoOnlyFields { transition: all .2s; }
+
+        /* ── Multi-page wrapper ── */
+        .pages-outer { overflow: hidden; position: relative; width: 100%; max-width: 100%; }
+        .pages-track {
+            display: flex;
+            transition: transform .4s cubic-bezier(.4,0,.2,1);
+            will-change: transform;
+            width: 100%;
+        }
+        .page-slide {
+            flex: 0 0 100%;
+            width: 100%;
+            max-width: 100%;
+        }
+
+        /* ── Intro (page 1) ── */
+        .intro-body {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-top: none;
+            border-radius: 0 0 14px 14px;
+            padding: 32px 28px;
+        }
+        .intro-welcome {
+            text-align: center;
+            margin-bottom: 28px;
+        }
+        .intro-welcome .welcome-icon {
+            width: 56px; height: 56px; border-radius: 50%;
+            background: var(--accent-bg);
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 14px;
+            font-size: 26px;
+        }
+        .intro-welcome h2 {
+            font-size: 18px; font-weight: 600; color: var(--ink); margin-bottom: 6px;
+        }
+        .intro-welcome p {
+            font-size: 13px; color: var(--ink3); line-height: 1.6; max-width: 480px; margin: 0 auto;
+        }
+        .intro-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-bottom: 14px;
+        }
+        @media (max-width: 520px) { .intro-grid { grid-template-columns: 1fr; } }
+        .intro-grid .field { margin-bottom: 0; }
+
+        /* ── Driving skill rating ── */
+        .skill-rating { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+        .skill-btn {
+            flex: 1; min-width: 70px;
+            padding: 9px 6px;
+            border: 1.5px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--surface2);
+            font-family: var(--font);
+            font-size: 12px; font-weight: 500;
+            color: var(--ink2);
+            cursor: pointer;
+            text-align: center;
+            transition: all .18s;
+            line-height: 1.3;
+        }
+        .skill-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+        .skill-btn.selected { border-color: var(--accent); background: var(--accent); color: #fff; }
+
+        /* ── Step indicator ── */
+        .step-indicator {
+            display: flex; align-items: center; justify-content: center;
+            gap: 8px; margin-bottom: 24px;
+        }
+        .step-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--border); transition: background .25s;
+        }
+        .step-dot.active { background: var(--accent); }
+        .step-line {
+            flex: 1; max-width: 40px; height: 2px;
+            background: var(--border); border-radius: 2px; transition: background .25s;
+        }
+        .step-line.done-line { background: var(--accent); }
+
+        /* ── Back button ── */
+        .btn-back {
+            background: none; border: 1.5px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--ink2); font-family: var(--font);
+            font-size: 14px; font-weight: 500;
+            padding: 10px 18px; cursor: pointer;
+            transition: border-color .15s, color .15s;
+            display: inline-flex; align-items: center; gap: 6px;
+        }
+        .btn-back:hover { border-color: var(--accent); color: var(--accent); }
     </style>
 </head>
 <body>
@@ -285,17 +382,102 @@
         <span class="badge" id="sceneIdLabel">scene: —</span>
     </div>
 
-    <div class="body" id="mainBody">
-        <div id="imgContainer"></div>
+    <!-- ── Page wrapper ── -->
+    <div class="pages-outer">
+    <div class="pages-track" id="pagesTrack">
 
-        <!-- ── Participant ── -->
-        <div class="sec-label">Your information</div>
-        <div class="field">
-            <label for="participantId">Name <span class="req">*</span></label>
-            <input type="text" id="participantId" required placeholder="Enter your name">
+    <!-- ════════════════════════════════════════════
+         PAGE 1 — About You
+    ════════════════════════════════════════════ -->
+    <div class="page-slide">
+    <div class="intro-body">
+
+        <div class="step-indicator" id="stepIndicator1">
+            <div class="step-dot active" id="dot1"></div>
+            <div class="step-line" id="line1"></div>
+            <div class="step-dot" id="dot2"></div>
         </div>
 
-        <hr class="divider">
+        <div class="intro-welcome">
+            <div class="welcome-icon">👋</div>
+            <h2>Tell us a bit about yourself</h2>
+            <p>Before you begin annotating, please fill in a few quick details. This helps us understand the diversity of perspectives in our dataset.</p>
+        </div>
+
+        <div class="intro-grid">
+            <div class="field" style="grid-column:1/-1">
+                <label for="p_name">Full name <span class="req">*</span></label>
+                <input type="text" id="p_name" required placeholder="e.g. Maria Andersen">
+            </div>
+            <div class="field">
+                <label for="p_country">Country of residence <span class="req">*</span></label>
+                <input type="text" id="p_country" required placeholder="e.g. Denmark">
+            </div>
+            <div class="field">
+                <label for="p_age">Age category <span class="req">*</span></label>
+                <select id="p_age" required>
+                    <option value="">— select —</option>
+                    <option>Under 18</option>
+                    <option>18–24</option>
+                    <option>25–34</option>
+                    <option>35–44</option>
+                    <option>45–54</option>
+                    <option>55–64</option>
+                    <option>65 or older</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="p_gender">Gender <span class="req">*</span></label>
+                <select id="p_gender" required>
+                    <option value="">— select —</option>
+                    <option>Female</option>
+                    <option>Male</option>
+                    <option>Non-binary / third gender</option>
+                    <option>Prefer not to say</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="p_profession">Major / Profession <span class="req">*</span></label>
+                <input type="text" id="p_profession" required>
+            </div>
+        </div>
+
+        <div class="field" style="margin-bottom:24px">
+            <label>How do you rate your driving skills? <span class="req">*</span></label>
+            <div class="skill-rating" id="skillRating">
+                <button type="button" class="skill-btn" data-value="non-driver" onclick="selectSkill(this)">🚶 Non-driver</button>
+                <button type="button" class="skill-btn" data-value="beginner" onclick="selectSkill(this)">🟡 Beginner</button>
+                <button type="button" class="skill-btn" data-value="competent" onclick="selectSkill(this)">🔵 Competent</button>
+                <button type="button" class="skill-btn" data-value="experienced" onclick="selectSkill(this)">🟢 Experienced</button>
+                <button type="button" class="skill-btn" data-value="expert" onclick="selectSkill(this)">⭐ Expert</button>
+            </div>
+            <input type="hidden" id="p_driving_skill" value="">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn btn-primary" id="nextBtn" onclick="goToPage2()" style="width:100%;justify-content:center">
+                Continue to annotation →
+            </button>
+        </div>
+        <div class="status" id="statusPage1"></div>
+
+    </div>
+    </div><!-- end page 1 -->
+
+    <!-- ════════════════════════════════════════════
+         PAGE 2 — Annotation Form
+    ════════════════════════════════════════════ -->
+    <div class="page-slide">
+    <div class="body" id="mainBody">
+
+        <!-- Step indicator (page 2 view) -->
+        <div class="step-indicator" style="margin-bottom:20px">
+            <div class="step-dot active" id="dot1b"></div>
+            <div class="step-line done-line"></div>
+            <div class="step-dot active" id="dot2b"></div>
+        </div>
+
+        <div id="imgContainer"></div>
 
         <!-- ── Scene Conditions ── -->
         <div class="sec-label">Scene conditions</div>
@@ -440,6 +622,7 @@
 
         <!-- ── Submit ── -->
         <div class="btn-row">
+            <button class="btn-back" onclick="goToPage1()">← Back</button>
             <button class="btn btn-primary" id="submitBtn" onclick="submitForm()" disabled>
                 Submit annotation
             </button>
@@ -456,6 +639,10 @@
             <p id="doneMsg">Your responses have been saved.</p>
         </div>
     </div>
+    </div><!-- end page 2 -->
+
+    </div><!-- end pages-track -->
+    </div><!-- end pages-outer -->
 </div>
 
 <script>
@@ -630,6 +817,45 @@ const SCENE_QUESTIONS = [];
 const SCENE_ID = new URLSearchParams(location.search).get('scene_id') || 'static';
 
 document.getElementById('sceneIdLabel').textContent = 'scene: ' + SCENE_ID;
+
+// ── Multi-page navigation ──
+function goToPage2() {
+    const name   = document.getElementById('p_name').value.trim();
+    const country = document.getElementById('p_country').value.trim();
+    const age    = document.getElementById('p_age').value;
+    const gender = document.getElementById('p_gender').value;
+    const profession = document.getElementById('p_profession').value;
+    const skill  = document.getElementById('p_driving_skill').value;
+
+    const statusEl = document.getElementById('statusPage1');
+    if (!name)       { showStatusP1('Please enter your full name.', 'warn'); return; }
+    if (!country)    { showStatusP1('Please enter your country of residence.', 'warn'); return; }
+    if (!age)        { showStatusP1('Please select your age category.', 'warn'); return; }
+    if (!gender)     { showStatusP1('Please select your gender.', 'warn'); return; }
+    if (!profession) { showStatusP1('Please select your profession.', 'warn'); return; }
+    if (!skill)      { showStatusP1('Please rate your driving skills.', 'warn'); return; }
+
+    showStatusP1('', '');
+    document.getElementById('pagesTrack').style.transform = 'translateX(-100%)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function goToPage1() {
+    document.getElementById('pagesTrack').style.transform = 'translateX(0)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function selectSkill(btn) {
+    document.querySelectorAll('.skill-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    document.getElementById('p_driving_skill').value = btn.dataset.value;
+}
+
+function showStatusP1(msg, type) {
+    const el = document.getElementById('statusPage1');
+    el.textContent = msg;
+    el.className = 'status' + (msg ? ' ' + type : '');
+}
 
 // Load media (video preferred, fallback to image)
 (async () => {
@@ -962,11 +1188,11 @@ function collectSceneContext() {
 
 // ── Submit ──
 async function submitForm() {
-    const participantId = document.getElementById('participantId').value.trim();
+    const participantId = document.getElementById('p_name').value.trim();
     const narrative     = document.getElementById('narrative').value.trim();
     const hazardsYN     = document.getElementById('f_hazards_yn').value;
 
-    if (!participantId) { showStatus('Please enter your name.', 'warn'); return; }
+    if (!participantId) { showStatus('Please go back and enter your name.', 'warn'); return; }
 
     const wordCount = narrative ? narrative.split(/\s+/).filter(w => w).length : 0;
     if (wordCount < 40) { showStatus(`Please write at least 40 words in your description (currently ${wordCount}).`, 'warn'); return; }
@@ -1015,6 +1241,14 @@ async function submitForm() {
         const payload = {
             scene_id:       SCENE_ID,
             participant_id: participantId,
+            participant_info: {
+                name:          document.getElementById('p_name').value.trim(),
+                country:       document.getElementById('p_country').value.trim(),
+                age_category:  document.getElementById('p_age').value,
+                gender:        document.getElementById('p_gender').value,
+                profession:    document.getElementById('p_profession').value,
+                driving_skill: document.getElementById('p_driving_skill').value,
+            },
             narrative:      narrative,
             scene_fields:   collectMCQ(),
             objects:        objects,

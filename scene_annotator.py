@@ -3,6 +3,7 @@ import base64
 import math
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -14,12 +15,22 @@ import numpy as np
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
 try:
-    from tracker_bytetrack import run_bytetrack
+    from yolo_bytetrack import (
+        run_yolo_and_track,
+        process_video_frames,
+        get_track_motion_summary,
+        reset_tracker,
+        draw_tracks,
+        TRACKER_FRAME_RATE,
+        VIDEO_CHUNK_SECONDS as _YBT_CHUNK,
+    )
     TRACKER_AVAILABLE = True
 except Exception as e:
-    print(f"⚠  ByteTracker import failed: {e}. Install: pip install ultralytics")
+    print(f"⚠  yolo_bytetrack import failed: {e}")
     TRACKER_AVAILABLE = False
-    run_bytetrack = None
+    run_yolo_and_track = None
+    process_video_frames = None
+    get_track_motion_summary = None
 
 try:
     from google.oauth2 import service_account
@@ -48,10 +59,10 @@ TOKEN_FILE       = "token.json"
 SHEET_ID_FILE    = "spreadsheet_id.txt"
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVER_PORT      = 7860
-DEFAULT_TARGET   = "assets/7.mp4" 
-TOP_N_OBJECTS_FOR_GAP_FILL = 3  
-VIDEO_CHUNK_SECONDS = 5
-TRACKER_FRAME_RATE = 5
+DEFAULT_TARGET   = "assets/7.mp4"
+TOP_N_OBJECTS_FOR_GAP_FILL = 3
+# Frame/tracking constants live in yolo_bytetrack.py — imported here for use
+VIDEO_CHUNK_SECONDS = _YBT_CHUNK if TRACKER_AVAILABLE else 5
 
 
 CUMULATIVE_SUMMARY_SCHEMA = {
@@ -181,95 +192,37 @@ SHEET_HEADERS = [
     "Object Count Summary"
 ]
 
-_yolo_model = None
+# YOLO detection and tracking are handled by yolo_bytetrack.py.
+# Use run_yolo_and_track(frame, frame_idx) for per-frame detection+tracking.
 
-def get_yolo():
-    global _yolo_model
-    if _yolo_model is None and YOLO_AVAILABLE:
-        print("Loading YOLO11 model...")
-        _yolo_model = YOLO("yolo11l.pt")
-    return _yolo_model
-
-
-def run_yolo(frame):
-    model = get_yolo()
-    h_orig, w_orig = frame.shape[:2]
-    scale  = min(1024 / max(h_orig, w_orig), 1.0)
-    small  = cv2.resize(frame, (int(w_orig * scale), int(h_orig * scale)))
-    h, w   = small.shape[:2]
-    canvas = small.copy()
-
-    vehicle_count       = 0
-    pedestrian_count    = 0
-    cyclist_count       = 0
-    traffic_light_count = 0
-    other_count         = 0
-    detections          = []
-    drawn_labels        = []
-    valid_id            = 0
-
-    if model:
-        results = model(small, conf=0.25)
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cls_id          = int(box.cls[0])
-            class_name      = model.names[cls_id]
-            confidence      = float(box.conf[0])
-            area            = (x2 - x1) * (y2 - y1)
-
-            if area < 600 and class_name != "traffic light":
-                continue
-
-            valid_id += 1
-
-            if class_name in VEHICLE_CLASSES:       vehicle_count    += 1
-            elif class_name == "person":             pedestrian_count += 1
-            elif class_name == "bicycle":            cyclist_count    += 1
-            elif class_name == "traffic light":      traffic_light_count += 1
-            else:                                    other_count      += 1
-
-            cx = (x1 + x2) / 2
-            horizontal = "Left" if cx < w * 0.40 else ("Right" if cx > w * 0.60 else "Center")
-            depth      = "Foreground" if y2 > h * 0.50 else "Background"
-            position   = f"{depth} {horizontal}"
-
-            detections.append({
-                "id":           valid_id,
-                "type":         class_name,
-                "confidence":   round(confidence, 2),
-                "position":     position,
-                "area":         area,
-                "bounding_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-            })
-
-            color = ((cls_id * 85) % 255, (cls_id * 150) % 255, (255 - (cls_id * 45) % 255))
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-
-            label           = f"ID:{valid_id} {confidence:.2f}"
-            font            = cv2.FONT_HERSHEY_SIMPLEX
-            fs, ft          = 0.45, 1
-            (tw, th), _     = cv2.getTextSize(label, font, fs, ft)
-            ly              = y1 - 10 if y1 > 40 else y1 + th + 10
-            for _ in range(20):
-                if not any(abs(x1 - px) < tw + 30 and abs(ly - py) < th + 15
-                           for (px, py, _, _) in drawn_labels):
-                    break
-                ly -= th + 15
-            drawn_labels.append((x1, ly, x1 + tw, ly + th))
-            cv2.rectangle(canvas, (x1, ly - th - 5), (x1 + tw + 5, ly + 5), (0, 0, 0), -1)
-            cv2.putText(canvas, label, (x1 + 2, ly), font, fs, (255, 255, 255), ft, cv2.LINE_AA)
-
-    yolo_data = {
-        "frame_info":         {"width": w, "height": h},
-        "total_objects":      valid_id,
-        "vehicle_count":      vehicle_count,
-        "pedestrian_count":   pedestrian_count,
-        "cyclist_count":      cyclist_count,
-        "traffic_light_count":traffic_light_count,
-        "other_count":        other_count,
-        "detections":         detections
+def _yolo_data_from_frame_result(frame_data: dict) -> dict:
+    """Convert yolo_bytetrack frame output to the legacy yolo_data format expected by analyse_frame."""
+    ss = frame_data.get("scene_summary", {})
+    dets = ss.get("detected_objects", [])
+    detections = []
+    for d in dets:
+        detections.append({
+            "id":           d.get("id"),
+            "type":         d.get("type"),
+            "confidence":   d.get("confidence"),
+            "position":     d.get("position"),
+            "area":         d.get("area"),
+            "bounding_box": d.get("bounding_box"),
+            "track_id":     d.get("track_id", -1),
+            "color":        d.get("color", "unknown"),
+            "speed":        d.get("speed", "unknown"),
+            "direction":    d.get("direction", "unknown"),
+        })
+    return {
+        "frame_info":          {"width": 0, "height": 0},
+        "total_objects":       len(dets),
+        "vehicle_count":       ss.get("total_vehicles_detected", 0),
+        "pedestrian_count":    ss.get("total_pedestrians_detected", 0),
+        "cyclist_count":       ss.get("total_cyclists_detected", 0),
+        "traffic_light_count": ss.get("total_traffic_lights_detected", 0),
+        "other_count":         0,
+        "detections":          detections,
     }
-    return yolo_data, canvas
 
 
 #  Qwen helpers 
@@ -307,30 +260,14 @@ def _safe_parse_json(raw: str) -> dict:
     return {}
 
 
-#  Global Motion Compensation (GMC) 
-#  Full frame-based GMC would require loading video frames during tracker phase.
-# Currently disabled (returns 0,0) to avoid false movement filtering.
-
-def apply_gmc_to_bbox(bbox, gmc_tx=0, gmc_ty=0):
-    """Compensate bbox for camera motion (currently stub: gmc_tx/y typically 0)."""
-    if gmc_tx == 0 and gmc_ty == 0:
-        return bbox  
-    return {
-        "x1": bbox["x1"] - gmc_tx,
-        "y1": bbox["y1"] - gmc_ty,
-        "x2": bbox["x2"] - gmc_tx,
-        "y2": bbox["y2"] - gmc_ty
-    }
-
+# GMC, get_bbox_center, calc_movement_distance are now in yolo_bytetrack.py.
+# Thin helpers kept here for any legacy callers:
 
 def get_bbox_center(bbox):
-    """Return center point of bbox."""
     return ((bbox["x1"] + bbox["x2"]) / 2, (bbox["y1"] + bbox["y2"]) / 2)
 
-
-def calc_movement_distance(center1, center2):
-    """Calculate Euclidean distance between two points."""
-    return math.sqrt((center1[0] - center2[0]) ** 2 + (center1[1] - center2[1]) ** 2)
+def calc_movement_distance(c1, c2):
+    return math.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)
 
 
 def build_detection_color_map(seconds_data):
@@ -406,31 +343,93 @@ def call_qwen_text(prompt):
 
 
 #  Per-Frame Analysis 
-def analyse_frame(frame, scene_id, out_json_path, out_img_path):
-    is_static         = (scene_id == "static")
-    yolo_data, canvas = run_yolo(frame)
+def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, frame_idx=None, annotated_frame=None):
+    """
+    Analyse one frame with Qwen vision.
 
-    with open(f"output/yolo_raw_{scene_id}.json", "w") as f:
+    yolo_data:       pre-computed dict from _yolo_data_from_frame_result().
+                     If None, falls back to calling run_yolo_and_track() directly.
+    frame_idx:       raw frame index (for tracker calls when yolo_data is None).
+    annotated_frame: optional frame with YOLO bounding boxes + IDs already drawn.
+                     When provided, this is sent to Qwen instead of the raw frame.
+    """
+    is_static = (scene_id == "static")
+
+    # ── Obtain YOLO + tracker data ─────────────────────────────────────────
+    if yolo_data is None:
+        if TRACKER_AVAILABLE and run_yolo_and_track is not None:
+            _fidx = frame_idx if frame_idx is not None else 0
+            frame_data = run_yolo_and_track(frame, _fidx)
+            yolo_data  = _yolo_data_from_frame_result(frame_data)
+            # Save annotated debug image from yolo_bytetrack
+            if draw_tracks is not None:
+                canvas = draw_tracks(frame, frame_data)
+                yolo_img_path = out_img_path.replace(".jpg", "_yolo.jpg")
+                cv2.imwrite(yolo_img_path, canvas)
+                print(f"  Track-annotated image: {yolo_img_path}")
+        else:
+            print("  ⚠  No detector available — empty detections.")
+            yolo_data = {
+                "total_objects": 0, "vehicle_count": 0,
+                "pedestrian_count": 0, "cyclist_count": 0,
+                "traffic_light_count": 0, "other_count": 0,
+                "detections": [],
+            }
+
+    os.makedirs("output/yolo_raw", exist_ok=True)
+    with open(f"output/yolo_raw/yolo_raw_{scene_id}.json", "w") as f:
         json.dump(yolo_data, f, indent=2)
 
     cv2.imwrite(out_img_path, frame)
-    yolo_img_path = out_img_path.replace(".jpg", "_yolo.jpg")
-    cv2.imwrite(yolo_img_path, canvas)
-    print(f"  YOLO bounded image: {yolo_img_path}")
 
     n_det  = yolo_data["total_objects"]
     n_veh  = yolo_data["vehicle_count"]
     n_ped  = yolo_data["pedestrian_count"]
     n_cyc  = yolo_data["cyclist_count"]
     n_tl   = yolo_data["traffic_light_count"]
-    schema = STATIC_SCHEMA if is_static else VIDEO_SCHEMA
 
-    # Compact detection list — only what Qwen needs to look up (id + bbox for color sampling)
-    compact_dets = [
-        {"id": d["id"], "type": d["type"], "pos": d["position"],
-         "bbox": d["bounding_box"], "area": d["area"]}
-        for d in yolo_data["detections"]
-    ]
+    # Grab track motion summary up to the current second if available
+    track_motions = {}
+    prev_context = ""
+    if not is_static:
+        try:
+            current_sec = int(scene_id)
+            if get_track_motion_summary is not None:
+                motions = get_track_motion_summary(0, current_sec)
+                for m in motions:
+                    track_motions[m["track_id"]] = f"{m['speed']}, {m['direction']}"
+            
+            if current_sec > 0:
+                prev_path = f"output/scene/output_sec_{current_sec - 1}.json"
+                if os.path.exists(prev_path):
+                    with open(prev_path) as f:
+                        prev_data = json.load(f)
+                        narrative = prev_data.get("scene_summary", {}).get("scene_description", "")
+                        if narrative:
+                            prev_context = (
+                                f"PREVIOUS FRAME CONTEXT (1 second ago):\\n"
+                                f"\\\"{narrative}\\\"\\n\\n"
+                                "Based on the PREVIOUS FRAME and the CURRENT DETECTIONS, describe what has changed or progressed.\\n\\n"
+                            )
+        except Exception:
+            pass
+
+    # Compact detection list for Qwen — include pixel color and motion history
+    compact_dets = []
+    for d in yolo_data["detections"]:
+        tid = d.get("track_id", -1)
+        det = {
+            "id":    d["id"],
+            "type":  d["type"],
+            "pos":   d["position"],
+            "bbox":  d["bounding_box"],
+            "area":  d["area"],
+            "track_id": tid,
+            "pixel_color": d.get("color", "unknown"),  # HSV pixel color hint
+        }
+        if tid in track_motions:
+            det["motion_history"] = track_motions[tid]
+        compact_dets.append(det)
 
     action_note = ""
     if not is_static:
@@ -441,9 +440,23 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
             "  - For CYCLISTS (cyclist, bicycle): moving | stopped | turning\n"
         )
 
+    # Tell Qwen whether the image has pre-drawn boxes
+    has_boxes = annotated_frame is not None
+    box_context = (
+        "IMPORTANT: This image has YOLO bounding boxes already drawn on it. "
+        "Each box is labelled with #ID (e.g. #1, #2, …). "
+        "The #ID corresponds to the track_id field in the detections list below. "
+        "Use the boxes and IDs to spatially ground your descriptions.\n\n"
+    ) if has_boxes else ""
+
+    # Use annotated frame for Qwen when available
+    qwen_frame = annotated_frame if has_boxes else frame
+
     prompt = (
-        f"You are annotating a traffic scene image. {n_det} objects were detected by YOLO.\n\n"
-        f"DETECTIONS (id, type, position, bounding_box already confirmed):\n"
+        f"{prev_context}"
+        f"{box_context}"
+        f"You are annotating a traffic scene image. {n_det} objects were detected by YOLO+ByteTrack at 1 fps.\n\n"
+        f"DETECTIONS (id, type, position, bounding_box, track_id, pixel_color already computed):\n"
         f"{json.dumps(compact_dets)}\n\n"
         f"YOUR JOB — return JSON with these keys only:\n"
         f"1. scene_summary with:\n"
@@ -456,19 +469,19 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
         f"   - hazards_and_events: 1 sentence or \"none\".\n"
         f"2. detected_objects: array of {n_det} items, one per YOLO detection:\n"
         f"   {{object_id, color, size}}\n"
-        f"   color (REQUIRED): white/black/silver/gray/red/blue/green/yellow/orange/brown/mixed/unknown\n"
+        f"   color (REQUIRED for vehicles/cyclists ONLY): use pixel_color hint unless you can clearly see a different color.\n"
+        f"   color must be: white/black/silver/gray/red/blue/green/yellow/orange/brown/mixed\n"
         f"   size (REQUIRED for vehicles/cyclists ONLY): small(<5% frame)/medium(5-20%)/large(>20%)\n"
         f"   {action_note}"
         f"CRITICAL:\n"
-        f"  - EVERY object MUST have a color. Do NOT skip or leave null.\n"
-        f"  - Size is REQUIRED for: cars, vans, trucks, buses, motorcycles, cyclists, bicycles.\n"
-        f"  - Size is NOT included for: pedestrians, traffic lights, road signs.\n"
+        f"  - Color and Size are REQUIRED for: cars, vans, trucks, buses, motorcycles, cyclists, bicycles.\n"
+        f"  - Color and Size are NOT included for: pedestrians, traffic lights, road signs.\n"
         f"Return ONLY the JSON object, no explanation."
     )
 
-    print(f"  > Qwen analysing frame '{scene_id}'...")
+    print(f"  > Qwen analysing frame '{scene_id}' ({'annotated+boxes' if annotated_frame is not None else 'raw frame'})...")
     try:
-        result = call_qwen_vision(frame, prompt)
+        result = call_qwen_vision(qwen_frame, prompt)
     except Exception as e:
         print(f"  ! Qwen vision error: {e}")
         result = {}
@@ -485,40 +498,47 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path):
     for y in yolo_data["detections"]:
         yid = str(y["id"])
         ai  = qwen_objs.get(yid, {})
-        
-        # Determine if this object type should have size
+
         obj_type = y["type"].lower()
         is_vehicle = any(x in obj_type for x in ["car", "van", "truck", "bus", "motorcycle"])
         is_vehicle_or_cyclist = is_vehicle or any(x in obj_type for x in ["cyclist", "bicycle"])
-        
+
         obj = {
             "object_id":        y["id"],
+            "track_id":         y.get("track_id", -1),
             "object_type":      y["type"],
             "confidence":       y["confidence"],
-            "color":            ai.get("color"),
             "position":         y["position"],
             "bounding_box":     y["bounding_box"],
             "bounding_box_area":y["area"],
+            "speed":            y.get("speed", "unknown"),
+            "direction":        y.get("direction", "unknown"),
         }
-        
-        if is_vehicle and (obj["color"] is None or obj["color"] == ""):
-            obj["color"] = "gray"  # default fallback for vehicles
-        
-        # Only add size for vehicles/cyclists, not for pedestrians or traffic lights
+
+        is_pedestrian = any(x in obj_type for x in ["person", "pedestrian"])
+        if not is_pedestrian:
+            # Colour priority: STRICTLY pixel-based, no fallbacks or 'unknown'
+            pixel_color = y.get("color")
+            if not pixel_color or pixel_color == "unknown":
+                pixel_color = "black"
+            
+            obj["color"] = pixel_color
+            obj["pixel_color"] = pixel_color
+
         if is_vehicle_or_cyclist:
             obj["size"] = ai.get("size") or "unknown"
-        elif ai.get("size"):  # Only include if explicitly provided (e.g., for other object types)
+        elif ai.get("size"):
             obj["size"] = ai.get("size")
-        
+
         if not is_static:
-            # Object-type-aware action defaults
-            if "traffic light" in obj_type or "light" in obj_type:
+            obj_type_l = obj_type
+            if "traffic light" in obj_type_l or "light" in obj_type_l:
                 default_action = "static"
-            elif any(x in obj_type for x in ["person", "pedestrian"]):
+            elif any(x in obj_type_l for x in ["person", "pedestrian"]):
                 default_action = "standing"
-            elif any(x in obj_type for x in ["cyclist", "bicycle"]):
+            elif any(x in obj_type_l for x in ["cyclist", "bicycle"]):
                 default_action = "stopped"
-            else:  # vehicles (car, truck, bus, etc.)
+            else:
                 default_action = "parked"
             obj["action"] = ai.get("action", default_action)
         final_objs.append(obj)
@@ -550,116 +570,7 @@ def _dump_json(path, data):
         json.dump(data, f, indent=2)
 
 
-def _collect_track_movements_for_span(span_start, span_end, tracks_path="output/tracks.json", frames_data=None):
-    """
-    Collect movements from tracker with color enrichment from frame data.
-    frames_data: list of per-frame JSON (for color enrichment)
-    """
-    if not os.path.exists(tracks_path):
-        return []
-    try:
-        data = _load_json(tracks_path)
-    except Exception:
-        return []
 
-    color_map = {}
-    if frames_data:
-        color_map = build_detection_color_map(frames_data)
-
-    movements = []
-    
-    for track in data.get("tracks", []) or []:
-        frames = track.get("frames", []) or []
-        span_frames = [f for f in frames if span_start <= _safe_int(f.get("second"), -1) <= span_end]
-        if not span_frames:
-            continue
-
-        obj_type = track.get('object_type', 'object')
-        track_id = track.get('track_id')
-        first_detection_id = track.get("first_detection_id")
-        
-        modal_color = "unknown"
-        if first_detection_id:
-            modal_color = color_map.get(str(first_detection_id), "unknown")
-        
-        evidence_secs = []
-        seen = set()
-        for f in span_frames:
-            sec = _safe_int(f.get("second"), -1)
-            if sec not in seen:
-                evidence_secs.append(sec)
-                seen.add(sec)
-        
-        if len(span_frames) == 1:
-            movements.append({
-                "object_hint": f"track_{track_id}:{obj_type}",
-                "color": modal_color,
-                "movement": "stationary (single frame)",
-                "evidence_seconds": evidence_secs,
-                "source": "tracker"
-            })
-            continue
-
-        # Multi-frame movement analysis
-        start_bbox = span_frames[0].get("bbox", {})
-        end_bbox = span_frames[-1].get("bbox", {})
-        
-        start_center = get_bbox_center(start_bbox)
-        end_center = get_bbox_center(end_bbox)
-        
-        delta_dist = calc_movement_distance(start_center, end_center)
-        delta_x = end_center[0] - start_center[0]
-        delta_y = end_center[1] - start_center[1]
-        
-        move_desc = "stationary"
-        if delta_dist > 5: 
-            if delta_x > 20:
-                move_desc = "moving right"
-            elif delta_x < -20:
-                move_desc = "moving left"
-            elif delta_y > 20:
-                move_desc = "moving down"
-            elif delta_y < -20:
-                move_desc = "moving up"
-            else:
-                move_desc = f"moving ({delta_dist:.1f}px)"
-        
-        movements.append({
-            "object_hint": f"track_{track_id}:{obj_type}",
-            "color": modal_color,
-            "movement": move_desc,
-            "distance_px": delta_dist,
-            "evidence_seconds": evidence_secs,
-            "source": "tracker"
-        })
-    return movements
-
-
-def _load_track_summaries(span_start, span_end, tracks_path="output/tracks.json"):
-    """Return compact summaries of tracks overlapping the given span."""
-    if not os.path.exists(tracks_path):
-        return []
-    try:
-        data = _load_json(tracks_path)
-    except Exception:
-        return []
-
-    summaries = []
-    for track in data.get("tracks", []) or []:
-        s = _safe_int(track.get("start_second"), -1)
-        e = _safe_int(track.get("end_second"), -1)
-        # overlap test
-        if e < span_start or s > span_end:
-            continue
-        summaries.append({
-            "track_id": track.get("track_id"),
-            "object_type": track.get("object_type"),
-            "start_second": s,
-            "end_second": e,
-            "frames_count": len(track.get("frames", []) or []),
-            "avg_speed_px_per_second": track.get("avg_speed_px_per_second")
-        })
-    return summaries
 
 
 def _normalize_second_frame(path):
@@ -737,9 +648,11 @@ def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_i
                     "frames": [p["second"] for p in positions]
                 })
 
-    tracker_movements = _collect_track_movements_for_span(span_start, span_end, frames_data=frames_payload)
-    if tracker_movements:
-        movements_detected = tracker_movements + movements_detected
+    # Fetch motion summaries directly from yolo_bytetrack.py in-memory state
+    if get_track_motion_summary is not None:
+        tracker_movements = get_track_motion_summary(span_start, span_end)
+        if tracker_movements:
+            movements_detected = tracker_movements + movements_detected
     
     avg_vehicles = int(sum(all_vehicles) / len(all_vehicles) + 0.5) if all_vehicles else 0
     avg_pedestrians = int(sum(all_pedestrians) / len(all_pedestrians) + 0.5) if all_pedestrians else 0
@@ -747,8 +660,6 @@ def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_i
     avg_traffic_lights = int(sum(all_traffic_lights) / len(all_traffic_lights) + 0.5) if all_traffic_lights else 0
     
     movements_json = json.dumps(movements_detected, indent=2) if movements_detected else "[]"
-    track_summaries = _load_track_summaries(span_start, span_end)
-    track_summaries_json = json.dumps(track_summaries, indent=2) if track_summaries else "[]"
     
     # Extract concise summaries from per-second data instead of passing full JSON
     frame_summaries = []
@@ -813,7 +724,6 @@ def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_i
         f"- Average traffic lights: {avg_traffic_lights}\n\n"
         f"## DETECTED MOVEMENTS (ONLY these in narrative):\n"
         f"{movements_json}\n\n"
-        f"## TRACKER DATA:\n{track_summaries_json}\n\n"
         "Return ONLY this JSON (no markdown, no explanation):\n"
         "{\n"
         "  \"annotator_type\": \"ai\",\n"
@@ -898,7 +808,7 @@ def _build_cumulative_from_cumulatives(left_summary, right_summary, scene_id):
     right_ts = right_summary.get("time_span", {}) or {}
     span_start = _safe_int(left_ts.get("start_second"), default=0)
     span_end = _safe_int(right_ts.get("end_second"), default=span_start)
-    track_summaries = _load_track_summaries(span_start, span_end)
+    track_summaries = get_track_motion_summary(span_start, span_end) if get_track_motion_summary is not None else []
     track_summaries_json = json.dumps(track_summaries, indent=2) if track_summaries else "[]"
     
     prompt = (
@@ -981,7 +891,7 @@ def generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECO
 
     second_paths = []
     for sec in range(num_seconds):
-        p = f"output/output_sec_{sec}.json"
+        p = f"output/scene/output_sec_{sec}.json"
         if os.path.exists(p):
             second_paths.append(p)
 
@@ -1106,19 +1016,20 @@ def generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECO
     final_path = current_nodes[0]["path"]
     final_summary = _load_json(final_path)
 
-    _dump_json("output/output_cumulative_mega.json", final_summary)
-    _dump_json("output/output_cumulative.json", final_summary)
+    os.makedirs("output/summaries", exist_ok=True)
+    _dump_json("output/summaries/output_cumulative_mega.json", final_summary)
+
 
     manifest = {
         "chunk_seconds": chunk_seconds,
         "total_seconds_processed": len(second_paths),
-        "final_summary_path": "output/output_cumulative_mega.json",
+        "final_summary_path": "output/summaries/output_cumulative_mega.json",
         "tree_root": tree_root
     }
     _dump_json("output/cumulative_tree/manifest.json", manifest)
 
-    print("  Saved: output/output_cumulative_mega.json")
-    print("  Saved: output/output_cumulative.json")
+    print("  Saved: output/summaries/output_cumulative_mega.json")
+
     print("  Saved: output/cumulative_tree/manifest.json")
     return final_summary
 
@@ -1178,9 +1089,10 @@ def generate_static_cumulative(result):
         "hazards_and_events":     ss.get("hazards_and_events", "none"),
         "annotation_confidence":  0.85
     }
-    with open("output/output_ai_cumulative.json", "w") as f:
+    os.makedirs("output/summaries", exist_ok=True)
+    with open("output/summaries/output_ai_cumulative.json", "w") as f:
         json.dump(cumulative, f, indent=2)
-    print("  Saved: output/output_ai_cumulative.json")
+    print("  Saved: output/summaries/output_ai_cumulative.json")
     return cumulative
 
 
@@ -1380,7 +1292,7 @@ flask_app = Flask(__name__)
 
 
 def _find_image(scene_id):
-    for c in [f"output/frame_{scene_id}.jpg", f"output/frame_sec_{scene_id}.jpg", "output/frame_static.jpg"]:
+    for c in [f"output/scene/frame_{scene_id}.jpg", f"output/scene/frame_sec_{scene_id}.jpg", "output/scene/frame_static.jpg"]:
         if os.path.exists(c):
             return c
     return None
@@ -1436,8 +1348,8 @@ def api_detect_gaps():
         # Add up to 3 major objects for the user to describe
         top_n = 3
         try:
-            if os.path.exists("output/output_static.json"):
-                with open("output/output_static.json") as f:
+            if os.path.exists("output/scene/output_static.json"):
+                with open("output/scene/output_static.json") as f:
                     d = json.load(f)
                     scene_sum = d.get("scene_summary", {})
                     
@@ -1644,79 +1556,98 @@ def start_server(port=SERVER_PORT):
 
 # ── Video Pipeline ────────────────────────────────────────────────────────────
 def process_video(path):
+    """
+    Full video pipeline:
+      1. yolo_bytetrack.process_video_frames() — YOLO + GMC + ByteTracker on
+         every Nth frame. Writes output/frame_{idx:06d}.json with track_id + color.
+      2. Per-second Qwen vision analysis — reads each second's frame, enriches
+         with scene description + confirmed colors.
+      3. Hierarchical cumulative summary via Qwen text.
+      4. Flask annotation server.
+    """
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         sys.exit("Error: cannot open video file.")
-
-    fps          = cap.get(cv2.CAP_PROP_FPS) or 25
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration     = max(1, int(total_frames / fps))
+    cap.release()
     print(f"Video: {duration}s @ {fps:.1f} FPS")
 
-    # --- High-frequency lightweight YOLO detections for tracker ---
-    try:
-        os.makedirs("output", exist_ok=True)
-        step = max(1, int(round(fps / TRACKER_FRAME_RATE)))
-        print(f"Writing frame-level detections every {step} frames (approx {TRACKER_FRAME_RATE} fps) into output/frame_*.json")
-        frame_idx = 0
-        while frame_idx < total_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, frame = cap.read()
-            if not ok:
-                break
-            ydata, _ = run_yolo(frame)
-            # minimal per-frame JSON compatible with tracker expectations
-            per_frame = {
-                "frame": frame_idx,
-                "scene_summary": {
-                    "total_vehicles_detected": ydata.get("vehicle_count", 0),
-                    "total_pedestrians_detected": ydata.get("pedestrian_count", 0),
-                    "total_cyclists_detected": ydata.get("cyclist_count", 0),
-                    "total_traffic_lights_detected": ydata.get("traffic_light_count", 0),
-                    "detected_objects": ydata.get("detections", [])
-                }
-            }
-            with open(f"output/frame_{frame_idx:06d}.json", "w") as f:
-                json.dump(per_frame, f, indent=2)
-            frame_idx += step
-    except Exception as e:
-        print(f"  ! Error writing frame-level detections: {e}")
+    # ── Clear existing output to ensure files are newly created for every run
+    if os.path.exists("output"):
+        print("Clearing existing output folder...")
+        shutil.rmtree("output", ignore_errors=True)
 
+    for _d in ["output", "output/frames", "output/annotated",
+               "output/scene", "output/yolo_raw",
+               "output/summaries", "output/cumulative_tree"]:
+        os.makedirs(_d, exist_ok=True)
 
+    # ── Step 1: YOLO + GMC + ByteTracker (yolo_bytetrack.py) ─────────────────
+    if TRACKER_AVAILABLE and process_video_frames is not None:
+        try:
+            print("\n🔍 Step 1: Running YOLO + GMC + ByteTracker...")
+            process_video_frames(
+                video_path=path,
+                out_dir="output",
+                frame_rate=TRACKER_FRAME_RATE,
+            )
+        except Exception as e:
+            print(f"  ❌ yolo_bytetrack error: {e}")
+            traceback.print_exc()
+    else:
+        print("⚠  yolo_bytetrack unavailable; skipping tracking step.")
+
+    # ── Step 2: Per-second Qwen analysis ─────────────────────────────────────
+    print("\n🧠 Step 2: Qwen per-second scene analysis...")
+    cap2 = cv2.VideoCapture(path)
     for sec in range(duration):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
-        ok, frame = cap.read()
+        cap2.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
+        ok, frame = cap2.read()
         if not ok:
             break
-        analyse_frame(frame,
-                      scene_id      = str(sec),
-                      out_json_path = f"output/output_sec_{sec}.json",
-                      out_img_path  = f"output/frame_sec_{sec}.jpg")
+
+        # Load pre-computed frame-level detections from yolo_bytetrack if available
+        # Find the closest frame_{idx:06d}.json for this second
+        actual_rate = TRACKER_FRAME_RATE if TRACKER_FRAME_RATE > 0 else min(int(fps), max(15, int(math.floor(fps * 0.5))))
+        step = max(1, int(round(fps / actual_rate)))
+        frame_idx_for_sec = int(sec * fps)
+        # Round to nearest tracked frame
+        tracked_idx = (frame_idx_for_sec // step) * step
+        precomp_path = f"output/frames/frame_{tracked_idx:06d}.json"
+        yolo_data = None
+        if os.path.exists(precomp_path):
+            try:
+                with open(precomp_path) as pf:
+                    precomp = json.load(pf)
+                yolo_data = _yolo_data_from_frame_result(precomp)
+            except Exception:
+                yolo_data = None
+
+        # Load pre-computed annotated image (YOLO boxes + IDs) for Qwen
+        annotated_img_path = f"output/annotated/frame_{tracked_idx:06d}_track.jpg"
+        annotated_frame = None
+        if os.path.exists(annotated_img_path):
+            annotated_frame = cv2.imread(annotated_img_path)
+
+        analyse_frame(
+            frame,
+            scene_id        = str(sec),
+            out_json_path   = f"output/scene/output_sec_{sec}.json",
+            out_img_path    = f"output/scene/frame_sec_{sec}.jpg",
+            yolo_data       = yolo_data,
+            frame_idx       = frame_idx_for_sec,
+            annotated_frame = annotated_frame,
+        )
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+    cap2.release()
 
-    cap.release()
-    # --- Run ByteTracker on per-second detections ---
-    try:
-        if TRACKER_AVAILABLE and run_bytetrack:
-            print("🔍 Running ByteTracker on per-second outputs...")
-            run_bytetrack(
-                num_seconds=duration,
-                frame_rate=TRACKER_FRAME_RATE,
-                per_second_json_dir="output",
-                out_path="output/tracks.json",
-                track_thresh=0.25,      # Confidence threshold
-                track_buffer=30,       # Frames to keep inactive tracks
-                match_thresh=0.8       # Similarity threshold
-            )
-        else:
-            print("⚠  ByteTracker unavailable; skipping tracking step.")
-            print("   Install: pip install ultralytics")
-    except Exception as e:
-        print(f"  ❌ Tracker error: {e}")
-        traceback.print_exc()
-
+    # ── Step 3: Hierarchical cumulative summary ───────────────────────────────
+    print("\n📊 Step 3: Building hierarchical cumulative summary...")
     generate_hierarchical_cumulative(duration, chunk_seconds=VIDEO_CHUNK_SECONDS)
+
     _ensure_spreadsheet()
     start_server()
     print("\nProcessed all frames. Open the form in your browser.")
@@ -1734,11 +1665,17 @@ def process_image(path):
     if frame is None:
         sys.exit(f"Error: cannot read image: {path}")
 
+    if os.path.exists("output"):
+        print("🧹 Clearing existing output folder...")
+        shutil.rmtree("output", ignore_errors=True)
+    for _d in ["output", "output/scene", "output/summaries"]:
+        os.makedirs(_d, exist_ok=True)
+
     print(f"Processing image: {path}")
     result = analyse_frame(frame,
                            scene_id      = "static",
-                           out_json_path = "output/output_static.json",
-                           out_img_path  = "output/frame_static.jpg")
+                           out_json_path = "output/scene/output_static.json",
+                           out_img_path  = "output/scene/frame_static.jpg")
 
     # Also write AI cumulative in the shared schema format
     generate_static_cumulative(result)

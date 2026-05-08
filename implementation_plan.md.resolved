@@ -1,0 +1,156 @@
+# YOLO + ByteTracker Integration & Separation
+
+## Overview
+
+The goal is to:
+1. **Extract** all YOLO + ByteTracker logic from `scene_annotator.py` into a dedicated `yolo_bytetrack.py` file
+2. **Tightly integrate** YOLO detections with ByteTracker so they share data (track IDs, colors, bounding boxes) synchronously per-frame
+3. **Implement real GMC** (Global Motion Compensation) using OpenCV optical flow so camera motion is subtracted before tracking
+4. **Improve motion calculations** using pixel-per-second velocity, directional vectors, and speed classification
+5. **Make "number of frames" a top-level config variable** across all relevant constants
+6. Keep `scene_annotator.py` focused on Qwen/LLM, Flask, Google Sheets, and orchestration (it imports from `yolo_bytetrack.py`)
+
+---
+
+## Proposed Changes
+
+### `yolo_bytetrack.py` — **[NEW FILE]**
+
+A self-contained module responsible for:
+
+#### YOLO Detection
+- Loads YOLO model once (singleton)
+- Runs detection on a frame → returns raw detections + annotated canvas
+- Maps class names to semantic types (vehicle, pedestrian, cyclist, etc.)
+- Assigns a **dominant color** per bounding box using HSV histogram (so color is computed from pixels, not just from Qwen)
+
+#### ByteTracker Integration
+- After YOLO detects objects in a frame, immediately feeds them into a **live** `ByteTrack` instance (not post-hoc from JSON files)
+- Returns `(track_id, object_type, color, bbox, confidence)` tuples — all synced in one place
+- Color is **propagated by track_id**: once a color is assigned to a track, it stays consistent across frames (no flicker)
+- Saves per-frame JSON with `track_id` already embedded into each detection
+
+#### GMC (Global Motion Compensation)
+- Uses `cv2.calcOpticalFlowFarneback` (dense) between consecutive frames to estimate global camera motion (translation tx, ty)
+- Compensates bounding boxes before passing to ByteTracker so background movement doesn't confuse tracking
+- Exposes `gmc_tx`, `gmc_ty` per frame
+
+#### Motion Calculations
+- Computes per-track velocity (px/frame), direction angle, and a classification (`stationary / slow / moving / fast`)
+- Tracks maintain a position history for smooth speed averaging
+- Exposes a `get_track_motion_summary()` function for use in cumulative summaries
+
+#### Config Variables (all at the top, easy to change)
+```python
+# ── Frame / Tracking Config ───────────────────────────────────────────────────
+TRACKER_FRAME_RATE       = 5      # frames per second for tracking
+MIN_FRAME_AREA           = 600    # min pixel area to accept a detection
+TRACK_ACTIVATION_THRESH  = 0.25   # ByteTrack: confidence threshold
+TRACK_BUFFER_FRAMES      = 30     # ByteTrack: frames to keep lost tracks
+MATCH_THRESH             = 0.8    # ByteTrack: IoU match threshold
+COLOR_CONSISTENCY_FRAMES = 5      # frames before locking a track's color
+MOTION_STATIONARY_PX     = 5      # px/frame below which = stationary
+MOTION_SLOW_PX           = 20     # px/frame below which = slow
+GMC_ENABLED              = True   # toggle Global Motion Compensation
+```
+
+---
+
+### `scene_annotator.py` — **[MODIFY]**
+
+Remove:
+- `run_yolo()` function
+- `get_yolo()` singleton
+- `apply_gmc_to_bbox()` (stub)
+- `get_bbox_center()`, `calc_movement_distance()` (moved to `yolo_bytetrack.py`)
+- `run_bytetrack` import from `tracker_bytetrack`
+- All per-frame JSON writing for the tracker (now done inside `yolo_bytetrack.py`)
+
+Keep (only imports the new module):
+```python
+from yolo_bytetrack import (
+    run_yolo_frame,           # run YOLO + color on a single frame
+    process_video_frames,     # runs YOLO+GMC+ByteTrack on entire video
+    get_track_motion_summary, # for cumulative summaries
+    TRACKER_FRAME_RATE,       # re-exported config
+)
+```
+
+The `process_video()` function in `scene_annotator.py` becomes much simpler — it delegates all detection/tracking to `yolo_bytetrack.process_video_frames()`, then calls Qwen analysis and cumulative summary generation.
+
+Config variables that currently live in `scene_annotator.py` that relate to frames/tracking will be moved to `yolo_bytetrack.py` and imported back.
+
+---
+
+### `tracker_bytetrack.py` — **[KEEP as fallback / post-hoc path]**
+
+This file currently runs ByteTracker in **post-hoc** mode (reads JSON files after the fact). It can remain as a standalone utility for reprocessing saved JSONs. It will no longer be called from `scene_annotator.py`'s main pipeline.
+
+---
+
+## Data Flow (After Changes)
+
+```
+Video Frame
+    │
+    ▼
+yolo_bytetrack.py
+    ├── YOLO detection → raw boxes + class names
+    ├── HSV color extraction per bbox
+    ├── GMC: optical flow → (tx, ty) camera shift
+    ├── Compensate boxes by (tx, ty)
+    ├── ByteTracker.update() → track_id assigned
+    ├── Color propagated by track_id (consistent)
+    ├── Motion: velocity, direction, classification
+    └── Save frame_{idx:06d}.json with track_id embedded
+    │
+    ▼
+scene_annotator.py
+    ├── Qwen vision: scene desc, color confirm, action
+    ├── Merge YOLO/ByteTrack data with Qwen enrichment
+    ├── Per-second JSON: output_sec_{sec}.json
+    ├── Cumulative summary (hierarchical tree)
+    └── Flask + Google Sheets
+```
+
+---
+
+## Key Integration Points
+
+| Data | Where it comes from | Where it goes |
+|------|-------------------|--------------|
+| `track_id` | ByteTracker (in `yolo_bytetrack.py`) | Per-frame JSON, cumulative movements |
+| `color` | HSV histogram (pixel-level, `yolo_bytetrack.py`) → confirmed/overridden by Qwen | Per-frame JSON, track color map |
+| `bounding_box` | YOLO → GMC-compensated → ByteTracker | Per-frame JSON |
+| `object_type` | YOLO class name | ByteTracker metadata, per-frame JSON |
+| `velocity / direction` | Motion calc in `yolo_bytetrack.py` | `get_track_motion_summary()` → cumulative |
+| GMC tx/ty | Optical flow in `yolo_bytetrack.py` | Applied before ByteTracker update |
+
+---
+
+## Verification Plan
+
+### Automated
+- Run `python yolo_bytetrack.py` standalone on a test video to confirm it produces `output/frame_*.json` with `track_id` fields
+- Run `python scene_annotator.py` end-to-end and check `output/tracks.json` has colors synced with Qwen output
+
+### Manual
+- Inspect `output/frame_000000.json` — should contain `track_id`, `color` (from pixels), `gmc_tx`, `gmc_ty`
+- Inspect `output/tracks.json` — tracks should have consistent color per `track_id`
+- Check cumulative JSON `temporal_movements` has meaningful motion descriptions
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> **Color source**: Currently Qwen assigns colors (text description). The new code will also compute pixel-based HSV colors. Which should take priority? Options:
+> - Pixel color first, Qwen overrides if confident → **recommended**
+> - Pixel color always (faster, no LLM needed)
+> - Qwen always (current behavior, but inconsistent)
+
+> [!NOTE]
+> **`tracker_bytetrack.py`**: Should it be deleted, kept as a standalone utility, or merged into `yolo_bytetrack.py`? Currently I plan to keep it as a standalone JSON-reprocessing tool.
+
+> [!NOTE]
+> **GMC method**: Farneback optical flow is accurate but can be slow on full-res frames. I'll run it on a downscaled version (e.g. 320px wide). Alternative: use keypoint-based homography (more robust but more code). Farneback is the default plan.
