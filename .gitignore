@@ -52,7 +52,7 @@ env/
 *.weights
 *.h5
 *.onnx
-
+*.pcd
 # Data files (optional - customize as needed)
 *.mp4
 *.webp
@@ -66,8 +66,11 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-data/v1.0-mini
+data/
+data/samples/
+data/sweeps/
 output_nuscenes/
+nuscenes-devkit/
 # OS
 .DS_Store
 Thumbs.db
