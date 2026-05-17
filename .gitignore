@@ -66,7 +66,8 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-
+data/v1.0-mini
+output_nuscenes/
 # OS
 .DS_Store
 Thumbs.db

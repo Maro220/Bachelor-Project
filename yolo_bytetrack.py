@@ -1,47 +1,89 @@
-"""
-yolo_bytetrack.py
-=================
-Integrated YOLO detection + ByteTracker with:
-  - Pixel-based HSV color extraction per bounding box
-  - Global Motion Compensation (GMC) via Farneback optical flow
-  - Live per-frame ByteTracker (not post-hoc from JSONs)
-  - Track color propagation (consistent track_id → color)
-  - Motion calculations: velocity, direction, classification
-  - All frame/tracking params as top-level config variables
-"""
-
 import json
 import math
 import os
 import cv2
 import numpy as np
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
-# ── Configuration (change these freely) ──────────────────────────────────────
-TARGET_FILE              = "assets/7.mp4"   # ← change to any video or image path
-TRACKER_FRAME_RATE       = 0      # frames per second fed to tracker (0 = auto: video_fps − 1, min 5)
-MIN_DETECTION_AREA       = 600    # min pixel area for non-traffic-light detections
-TRACK_ACTIVATION_THRESH  = 0.25   # ByteTrack: min confidence to activate track
-TRACK_BUFFER_FRAMES      = 30     # ByteTrack: frames to keep a lost track alive
-MATCH_THRESH             = 0.8    # ByteTrack: min IoU/similarity to match tracks
+try:
+    from nuscenes.nuscenes import NuScenes
+    from nuscenes.utils.data_classes import Box
+    from pyquaternion import Quaternion
+    NUSCENES_AVAILABLE = True
+except ImportError:
+    NUSCENES_AVAILABLE = False
+    print("⚠   nuscenes SDK not available.")
+
+try:
+    import open_clip
+    import torch
+    from PIL import Image as _PIL_Image
+    CLIP_AVAILABLE = True  # if false, use HSV instead
+except ImportError:
+    CLIP_AVAILABLE = False
+    print("⚠   open_clip not installed. Falling back to HSV color extraction.")
+    print("   Install with: pip install open_clip_torch")
+
+_clip_model       = None
+_clip_preprocess  = None
+_clip_text_emb    = None
+_clip_tokenizer   = None
+
+_COLOR_LABELS = [
+    "white vehicle",  "black vehicle",  "silver vehicle", "gray vehicle",
+    "red vehicle",    "blue vehicle",   "green vehicle",  "yellow vehicle",
+    "orange vehicle", "brown vehicle",  "beige vehicle",  "dark vehicle",
+]
+
+
+def _init_clip():
+    global _clip_model, _clip_preprocess, _clip_text_emb, _clip_tokenizer
+    if _clip_model is not None or not CLIP_AVAILABLE:
+        return
+    try:
+        import open_clip, torch, warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*QuickGELU mismatch.*')
+            _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
+                'ViT-B-32', pretrained='openai', quick_gelu=True
+            )
+        _clip_model.eval()
+        _clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
+        with torch.no_grad():
+            tokens         = _clip_tokenizer(_COLOR_LABELS)
+            _clip_text_emb = _clip_model.encode_text(tokens)
+            _clip_text_emb = _clip_text_emb / _clip_text_emb.norm(dim=-1, keepdim=True)
+        print("✓ CLIP color model loaded (ViT-B/32)")
+    except Exception as e:
+        print(f"⚠   CLIP init failed: {e}. Falling back to HSV.")
+        _clip_model = None
+
+TARGET_SCENE             = "scene-0757"   # NuScenes scene NAME (not a path) — SDK resolves frames from data/v1.0-mini/sweeps/CAM_FRONT/
+TRACKER_FRAME_RATE       = 0      # frames per second fed to tracker (0 = auto: all frames at video fps)
+MIN_DETECTION_AREA       = 400    # min pixel area for non-traffic-light detections
+TRACK_ACTIVATION_THRESH  = 0.25   # ByteTrack: min confidence to activate track (raised from 0.15)
+TRACK_BUFFER_FRAMES      = 120    # ByteTrack: frames to keep a lost track alive (~10s at 12 Hz — survives occlusions)
+MATCH_THRESH             = 0.85   # ByteTrack: IoU-DISTANCE threshold for matching (higher = more permissive; default 0.8). Was 0.55 → fragmented.
 COLOR_LOCK_FRAMES        = 5      # observations before locking a track's color
-MOTION_STATIONARY_PX     = 5.0    # px/frame below which = "stationary"
-MOTION_SLOW_PX           = 20.0   # px/frame below which = "slow"
-MOTION_FAST_PX           = 60.0   # px/frame above which = "fast"
-GMC_ENABLED              = True   # toggle Global Motion Compensation
-GMC_SCALE                = 0.25   # downscale factor for GMC computation (speed)
+MOTION_STATIONARY_PX     = 1.5    # px/frame below which = "stationary" (tuned for 25fps)
+MOTION_SLOW_PX           = 8.0    # px/frame below which = "slow"
+MOTION_FAST_PX           = 25.0   # px/frame above which = "fast"
 YOLO_MODEL_PATH          = "yolo11l.pt"
-YOLO_CONF_THRESH         = 0.25
-YOLO_INPUT_MAX_DIM       = 1024   # resize longest edge to this before inference
+YOLO_CONF_THRESH         = 0.15   # Lowered from 0.20 — same car was flickering in/out at ~0.18-0.22
+YOLO_INPUT_MAX_DIM       = 1600   # resize longest edge to this before inference
+YOLO_IMGSZ               = 1280   # inference resolution passed to ultralytics (was using default 640)
 VIDEO_CHUNK_SECONDS      = 5      # seconds per L1 cumulative chunk (re-exported)
 
-# ── YOLO class → semantic type mapping ───────────────────────────────────────
+NUSCENES_DATAROOT        = "data/v1.0-mini"
+NUSCENES_VERSION         = "v1.0-mini"
+NUSCENES_SCENE_TOKEN     = None  
+VALIDATE_WITH_GROUNDTRUTH= True   # Compare YOLO detections against NuScenes annotations
+
 VEHICLE_CLASSES    = {"car", "van", "motorcycle", "bus", "truck"}
 CYCLIST_CLASSES    = {"bicycle"}
 PEDESTRIAN_CLASSES = {"person"}
 TRAFFIC_LIGHT_CLS  = {"traffic light"}
-
 
 def _semantic_type(class_name: str) -> str:
     name = class_name.lower()
@@ -50,16 +92,7 @@ def _semantic_type(class_name: str) -> str:
     if name in PEDESTRIAN_CLASSES:    return "pedestrian"
     if name in TRAFFIC_LIGHT_CLS:     return "traffic_light"
     return name
-
-
 def _size_label(bbox: Dict, frame_w: int, frame_h: int) -> str:
-    """
-    Classify object size relative to the frame area.
-    Thresholds tuned for typical traffic / dashcam footage:
-      < 1.5%  of frame  → small   (distant vehicle)
-      1.5–8%  of frame  → medium  (typical mid-range vehicle)
-      > 8%    of frame  → large   (close-up / bus / truck)
-    """
     obj_area   = (bbox["x2"] - bbox["x1"]) * (bbox["y2"] - bbox["y1"])
     frame_area = frame_w * frame_h
     if frame_area == 0:
@@ -70,9 +103,7 @@ def _size_label(bbox: Dict, frame_w: int, frame_h: int) -> str:
     if ratio < 0.08:
         return "medium"
     return "large"
-
-
-# ── HSV pixel-based color extraction ─────────────────────────────────────────
+# HSV pixel-based color extraction 
 _HSV_PALETTE = [
     ("red",    (0,   60,  50),  (10,  255, 255)),
     ("orange", (11,  60,  50),  (25,  255, 255)),
@@ -89,31 +120,224 @@ _HSV_PALETTE = [
 ]
 
 
-def extract_dominant_color(frame_bgr: np.ndarray, bbox: Dict) -> str:
-    """Extract dominant color from a bounding-box region using HSV histogram."""
-    x1, y1 = max(0, bbox["x1"]), max(0, bbox["y1"])
-    x2, y2 = min(frame_bgr.shape[1], bbox["x2"]), min(frame_bgr.shape[0], bbox["y2"])
+def extract_dominant_color(frame_bgr: np.ndarray, bbox: Dict, obj_type: str = "",
+                            other_bboxes: Optional[List[Dict]] = None) -> str:
+    x1 = max(0, bbox["x1"])
+    y1 = max(0, bbox["y1"])
+    x2 = min(frame_bgr.shape[1], bbox["x2"])
+    y2 = min(frame_bgr.shape[0], bbox["y2"])
+
     if x2 <= x1 or y2 <= y1:
         return "unknown"
-    # Use central 60% of the box to avoid background bleeding
-    pw, ph = int((x2 - x1) * 0.2), int((y2 - y1) * 0.2)
-    roi = frame_bgr[y1 + ph:y2 - ph, x1 + pw:x2 - pw]
+
+    if obj_type in VEHICLE_CLASSES:
+        y2 = y1 + max(4, int((y2 - y1) * 0.70))
+
+    pw = max(1, int((x2 - x1) * 0.15))
+    ph = max(1, int((y2 - y1) * 0.15))
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    half_w = max(2, (x2 - x1) // 2 - pw)
+    half_h = max(2, (y2 - y1) // 2 - ph)
+
+    roi_x1 = cx - half_w
+    roi_y1 = cy - half_h
+
+    roi = frame_bgr[roi_y1: cy + half_h, roi_x1: cx + half_w]
     if roi.size == 0:
         return "unknown"
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    valid_mask = np.full(roi.shape[:2], 255, dtype=np.uint8)
+    if other_bboxes:
+        for ob in other_bboxes:
+            ox1 = max(0, int(ob["x1"]) - roi_x1)
+            oy1 = max(0, int(ob["y1"]) - roi_y1)
+            ox2 = min(roi.shape[1], int(ob["x2"]) - roi_x1)
+            oy2 = min(roi.shape[0], int(ob["y2"]) - roi_y1)
+            if ox2 > ox1 and oy2 > oy1:
+                valid_mask[oy1:oy2, ox1:ox2] = 0
+        if int(np.sum(valid_mask > 0)) < 20:
+            valid_mask[:] = 255
+
+    hsv    = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     counts = {}
     for name, lo, hi in _HSV_PALETTE:
-        mask = cv2.inRange(hsv, np.array(lo), np.array(hi))
-        counts[name] = int(np.sum(mask > 0))
-    # merge red + red2
+        color_mask = cv2.inRange(hsv, np.array(lo), np.array(hi))
+        color_mask = cv2.bitwise_and(color_mask, valid_mask)
+        counts[name] = int(np.sum(color_mask > 0))
+
+    # Merge the two red ranges
     counts["red"] = counts.pop("red", 0) + counts.pop("red2", 0)
-    
-    # Unconditionally return the best matching color
     best = max(counts, key=counts.get)
     return best
+def _normalize_illumination(crop_bgr: np.ndarray) -> np.ndarray:
+    #CLAHE on the L channel only — fixes shadows/overexposure without changing hue.
+    if crop_bgr.size == 0:
+        return crop_bgr
+    lab     = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    l_eq    = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l_eq, a, b]), cv2.COLOR_LAB2BGR)
 
 
-# ── YOLO singleton ────────────────────────────────────────────────────────────
+def _is_low_light(crop_bgr: np.ndarray) -> bool:
+    if crop_bgr.size == 0:
+        return True
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    return float(gray.mean()) < 45
+
+
+def extract_dominant_color_clip(frame_bgr: np.ndarray, bbox: Dict,
+                                 obj_type: str = "",
+                                 other_bboxes: Optional[List[Dict]] = None
+                                 ) -> Tuple[str, float]:
+    """
+    Extract vehicle color using CLIP zero-shot classification.
+    Returns (color_name, confidence). Falls back to HSV if CLIP unavailable.
+    """
+    _init_clip()
+
+    x1 = max(0, bbox["x1"])
+    y1 = max(0, bbox["y1"])
+    x2 = min(frame_bgr.shape[1], bbox["x2"])
+    y2 = min(frame_bgr.shape[0], bbox["y2"])
+
+    if x2 <= x1 or y2 <= y1:
+        return "unknown", 0.0
+
+    if obj_type in VEHICLE_CLASSES:
+        y2 = y1 + max(8, int((y2 - y1) * 0.70))
+
+    crop_bgr = frame_bgr[y1:y2, x1:x2].copy()
+    if crop_bgr.size == 0:
+        return "unknown", 0.0
+
+    crop_bgr  = _normalize_illumination(crop_bgr)
+    low_light = _is_low_light(crop_bgr)
+
+    if _clip_model is not None and CLIP_AVAILABLE:
+        try:
+            import torch
+            from PIL import Image as _PIL_Image
+            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            pil_img  = _PIL_Image.fromarray(crop_rgb)
+            with torch.no_grad():
+                img_t = _clip_preprocess(pil_img).unsqueeze(0)
+                img_e = _clip_model.encode_image(img_t)
+                img_e = img_e / img_e.norm(dim=-1, keepdim=True)
+                probs = (img_e @ _clip_text_emb.T * 100).softmax(dim=-1)[0]
+            best_idx   = int(probs.argmax())
+            confidence = float(probs[best_idx])
+            color_name = _COLOR_LABELS[best_idx].split()[0]
+
+            if low_light and confidence < 0.55:
+                return "dark", 0.3
+            if confidence < 0.35:
+                return "unknown", confidence
+            return color_name, confidence
+        except Exception as e:
+            print(f"  ⚠   CLIP color extraction error: {e}. Falling back to HSV.")
+
+
+    norm_bbox = {"x1": 0, "y1": 0,
+                 "x2": crop_bgr.shape[1], "y2": crop_bgr.shape[0]}
+    color_hsv = extract_dominant_color(crop_bgr, norm_bbox, obj_type, other_bboxes)
+    return color_hsv, 0.6
+
+
+#  NuScenes SDK loader 
+_nusc = None  
+_nusc_frame_data: Dict[int, Dict] = {}   # Maps frame_idx → ground truth annotations
+
+
+def _init_nuscenes_sdk(dataroot: str, version: str = "v1.0-mini"):
+    global _nusc
+    if _nusc is None:
+        _nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
+        print(f"✅ Loaded NuScenes {version}")
+    return _nusc
+
+
+def load_nuscenes_scene(scene_name: str, dataroot: str = NUSCENES_DATAROOT) -> bool:
+
+    global _nusc_frame_data
+    
+    if not NUSCENES_AVAILABLE:
+        return False
+    
+    nusc = _init_nuscenes_sdk(dataroot)
+    
+    # Find scene by name
+    scene_record = None
+    for scene in nusc.scene:
+        if scene_name in scene["name"]:
+            scene_record = scene
+            break
+    
+    if not scene_record:
+        print(f"⚠   Scene '{scene_name}' not found. Available scenes:")
+        for scene in nusc.scene[:10]:
+            print(f"     - {scene['name']}")
+        return False
+    
+    print(f"✅ Found scene: {scene_name} (token: {scene_record['token'][:8]}...)")
+    _extract_frame_annotations_sdk(nusc, scene_record["token"])
+    print(f"✅ Extracted {len(_nusc_frame_data)} frames with annotations")
+    return True
+
+
+def _extract_frame_annotations_sdk(nusc: 'NuScenes', scene_token: str):
+    global _nusc_frame_data
+    
+    _nusc_frame_data = {}
+    
+    # Get scene and iterate through samples
+    scene = nusc.get("scene", scene_token)
+    sample_token = scene["first_sample_token"]
+    
+    frame_idx = 0
+    while sample_token:
+        sample = nusc.get("sample", sample_token)
+        
+        # Get ego-pose from CAM_FRONT sample_data
+        cam_data_token = sample["data"]["CAM_FRONT"]
+        sample_data = nusc.get("sample_data", cam_data_token)
+        ego_pose = nusc.get("ego_pose", sample_data["ego_pose_token"])
+        
+        # Extract annotations for this frame
+        annotations = []
+        for ann_token in sample["anns"]:
+            ann = nusc.get("sample_annotation", ann_token)
+            # Get instance to find category
+            instance = nusc.get("instance", ann["instance_token"])
+            category = nusc.get("category", instance["category_token"])
+            category_name = category["name"]
+            
+            # Only include vehicles and pedestrians
+            if any(x in category_name for x in ["car", "truck", "bus", "motorcycle", "pedestrian", "bicycle"]):
+                annotations.append({
+                    "category": category_name,
+                    "translation": ann["translation"],
+                    "size": ann["size"],
+                    "rotation": ann["rotation"],
+                    "instance_token": ann["instance_token"],
+                })
+        
+        _nusc_frame_data[frame_idx] = {
+            "ego_pose": ego_pose,
+            "annotations": annotations,
+        }
+        
+        frame_idx += 1
+        sample_token = sample["next"]
+
+
+def get_frame_ground_truth(frame_idx: int) -> Optional[Dict]:
+    return _nusc_frame_data.get(frame_idx)
+
+
+#  YOLO  
 _yolo_model = None
 
 
@@ -125,178 +349,311 @@ def get_yolo():
             print(f"Loading YOLO model: {YOLO_MODEL_PATH}")
             _yolo_model = YOLO(YOLO_MODEL_PATH)
         except ImportError:
-            print("⚠  ultralytics not installed. YOLO unavailable.")
+            print(" ultralytics not installed. YOLO unavailable.")
     return _yolo_model
 
 
-# ── ByteTracker singleton (live, per-video) ───────────────────────────────────
-_byte_tracker = None
-_tracker_frame_rate = TRACKER_FRAME_RATE
+#  ByteTracker  
+_byte_tracker        = None
+_tracker_frame_rate  = TRACKER_FRAME_RATE
+_tracker_actual_fps: float = 0.0  
 
+def reset_tracker(frame_rate: int):
 
-def reset_tracker(frame_rate: int = TRACKER_FRAME_RATE):
-    """Reset/init the ByteTracker — call once per video."""
-    global _byte_tracker, _tracker_frame_rate
+    global _byte_tracker, _tracker_frame_rate, _tracker_actual_fps
     _tracker_frame_rate = frame_rate
+    _tracker_actual_fps = float(frame_rate) if frame_rate > 0 else 0.0
+ 
+    kalman_rate = max(10, frame_rate)   # ← THE FIX
+ 
     try:
         from supervision.tracker.byte_tracker.core import ByteTrack
         _byte_tracker = ByteTrack(
             track_activation_threshold=TRACK_ACTIVATION_THRESH,
             lost_track_buffer=TRACK_BUFFER_FRAMES,
             minimum_matching_threshold=MATCH_THRESH,
-            frame_rate=frame_rate,
+            frame_rate=kalman_rate,          # use clamped value here
         )
-        print(f"✅ ByteTracker initialised (frame_rate={frame_rate})")
+        print(f"✅ ByteTracker initialised (video fps={frame_rate}, kalman_rate={kalman_rate})")
     except ImportError:
         _byte_tracker = None
         print("⚠  supervision not installed. ByteTracker unavailable.")
-
-
+ 
+ 
 def get_tracker():
     global _byte_tracker
     if _byte_tracker is None:
         reset_tracker()
     return _byte_tracker
 
-
-# ── Track state: color propagation + motion history ──────────────────────────
+#  Track state: color propagation + motion history 
 class TrackState:
-    def __init__(self, track_id: int, obj_type: str):
-        self.track_id   = track_id
-        self.obj_type   = obj_type
-        self.color_votes: List[str] = []
-        self.locked_color: Optional[str] = None
-        self.positions: List[Tuple[float, float]] = []  # (cx, cy) per frame
-        self.frame_indices: List[int] = []
+    _EMA_ALPHA = 0.30   # smoothing factor: higher = faster response to changes
 
-    def add_observation(self, frame_idx: int, bbox: Dict, color_candidate: str):
-        cx = (bbox["x1"] + bbox["x2"]) / 2.0
-        cy = (bbox["y1"] + bbox["y2"]) / 2.0
-        self.positions.append((cx, cy))
+    def __init__(self, track_id: int, obj_type: str):
+        self.track_id    = track_id
+        self.obj_type    = obj_type
+        self.color_votes: List[Tuple[str, float]] = []
+        self.locked_color: Optional[str]          = None
+        self.positions: List[Tuple[float, float]] = []
+        self.frame_indices: List[int]             = []
+
+        # Anchor: cumulative camera offset at first observation
+        self._anchor_tx: float = 0.0
+        self._anchor_ty: float = 0.0
+        self._anchor_set: bool = False
+
+        # EMA state
+        self._smoothed_v: Optional[float] = None
+        # Raw (un-compensated) centre from the previous frame — used with the
+        # per-frame affine inverse to compute camera-cancelled velocity.
+        self._prev_raw: Optional[Tuple[float, float]] = None
+
+    def add_observation(
+        self,
+        frame_idx: int,
+        bbox: Dict,
+        color_candidate: str,
+        color_confidence: float = 1.0,
+        cum_tx: float = 0.0,
+        cum_ty: float = 0.0,
+        frame_M_inv: Optional[np.ndarray] = None,
+    ):
+
+        #cum_tx / cum_ty : cumulative camera translation since video start.
+        #frame_M_inv     : 2×3 inverse affine for this frame (curr→prev, full-res).
+         #                 raw centre into the previous frame's coordinate system and
+          #                comparing it to the actual previous raw centre.  This cancels
+           #               translation + rotation + scale in one step, so parked objects
+            #              near the frame edge no longer get flagged as moving when the
+             #             ego-vehicle turns.  Falls back to translation-only when None.
+        raw_cx = (bbox["x1"] + bbox["x2"]) / 2.0
+        raw_cy = (bbox["y1"] + bbox["y2"]) / 2.0
+
+        if not self._anchor_set:
+            self._anchor_tx = cum_tx
+            self._anchor_ty = cum_ty
+            self._anchor_set = True
+
+        stable_cx = raw_cx - (cum_tx - self._anchor_tx)
+        stable_cy = raw_cy - (cum_ty - self._anchor_ty)
+
+        if self._prev_raw is not None:
+            if frame_M_inv is not None:
+                pt = np.array([raw_cx, raw_cy, 1.0])
+                corrected_cx = float(frame_M_inv[0] @ pt)
+                corrected_cy = float(frame_M_inv[1] @ pt)
+                inst_v = math.hypot(corrected_cx - self._prev_raw[0],
+                                    corrected_cy - self._prev_raw[1])
+            else:
+                prev_cx, prev_cy = self.positions[-1]
+                inst_v = math.hypot(stable_cx - prev_cx, stable_cy - prev_cy)
+
+            if self._smoothed_v is None:
+                self._smoothed_v = inst_v
+            else:
+                self._smoothed_v = (
+                    self._EMA_ALPHA * inst_v
+                    + (1.0 - self._EMA_ALPHA) * self._smoothed_v
+                )
+
+        self._prev_raw = (raw_cx, raw_cy)
+        self.positions.append((stable_cx, stable_cy))
         self.frame_indices.append(frame_idx)
+
+        # Confidence-weighted color voting
         if self.locked_color is None:
-            if color_candidate not in ("unknown", "mixed"):
-                self.color_votes.append(color_candidate)
-            if len(self.color_votes) >= COLOR_LOCK_FRAMES:
-                self.locked_color = Counter(self.color_votes).most_common(1)[0][0]
+            if color_candidate not in ("unknown", "dark", "mixed"):
+                self.color_votes.append((color_candidate, color_confidence))
+            high_conf = [(c, w) for c, w in self.color_votes if w > 0.5]
+            if len(high_conf) >= COLOR_LOCK_FRAMES:
+                from collections import defaultdict
+                scores = defaultdict(float)
+                for c, w in high_conf:
+                    scores[c] += w
+                self.locked_color = max(scores, key=scores.get)
 
     @property
     def color(self) -> str:
         if self.locked_color:
             return self.locked_color
         if self.color_votes:
-            return Counter(self.color_votes).most_common(1)[0][0]
+            from collections import defaultdict
+            scores = defaultdict(float)
+            for c, w in self.color_votes:
+                scores[c] += w
+            return max(scores, key=scores.get) if scores else "unknown"
         return "unknown"
-
     def velocity_px_per_frame(self) -> Optional[float]:
-        if len(self.positions) < 2:
-            return None
-        dists = [
-            math.hypot(self.positions[i][0] - self.positions[i-1][0],
-                       self.positions[i][1] - self.positions[i-1][1])
-            for i in range(1, len(self.positions))
-        ]
-        return sum(dists) / len(dists)
+        return self._smoothed_v  
+
+    def speed_label(self) -> str:
+        ema_v = self.velocity_px_per_frame()
+        avg_v = None
+        if len(self.positions) >= 2:
+            span = self.frame_indices[-1] - self.frame_indices[0]
+            if span > 0:
+                dx = self.positions[-1][0] - self.positions[0][0]
+                dy = self.positions[-1][1] - self.positions[0][1]
+                avg_v = math.hypot(dx, dy) / span
+
+        v = max(x for x in (ema_v, avg_v) if x is not None) if (ema_v is not None or avg_v is not None) else None
+        if v is None:                    return "unknown"
+        if v < MOTION_STATIONARY_PX:    return "stationary"
+        if v < MOTION_SLOW_PX:          return "slow"
+        if v < MOTION_FAST_PX:          return "moving"
+        return "fast"
 
     def direction_label(self) -> str:
+        speed = self.speed_label()
+        if speed in ("stationary", "unknown"):
+            return "stationary"
+
         if len(self.positions) < 2:
             return "stationary"
+
         dx = self.positions[-1][0] - self.positions[0][0]
         dy = self.positions[-1][1] - self.positions[0][1]
         dist = math.hypot(dx, dy)
+
         if dist < MOTION_STATIONARY_PX:
             return "stationary"
-        angle = math.degrees(math.atan2(-dy, dx))  # y-flip for screen coords
+        angle = math.degrees(math.atan2(-dy, dx))
         if   -45  <= angle <  45:  return "moving right"
         elif  45  <= angle < 135:  return "moving up"
         elif -135 <= angle < -45:  return "moving down"
         else:                      return "moving left"
 
-    def speed_label(self) -> str:
-        v = self.velocity_px_per_frame()
-        if v is None:                     return "unknown"
-        if v < MOTION_STATIONARY_PX:     return "stationary"
-        if v < MOTION_SLOW_PX:           return "slow"
-        if v < MOTION_FAST_PX:           return "moving"
-        return "fast"
-
-
 _track_states: Dict[int, TrackState] = {}
-
-
 def _get_or_create_state(track_id: int, obj_type: str) -> TrackState:
     if track_id not in _track_states:
         _track_states[track_id] = TrackState(track_id, obj_type)
     return _track_states[track_id]
 
-
 def reset_track_states():
     global _track_states
     _track_states = {}
 
-
-# ── GMC — Global Motion Compensation ─────────────────────────────────────────
-_prev_gray_small: Optional[np.ndarray] = None
+#  GMC  Global Motion Compensation (ego-pose only)
 _cumulative_tx: float = 0.0
 _cumulative_ty: float = 0.0
+_frame_gmc_M_inv: Optional[np.ndarray] = None   # 3×3 homography inverse (curr→prev, full-res)
 
+#  Ego-pose state (NuScenes only) 
+_ego_poses: Optional[List[Dict]] = None
+_ego_pose_cam_K: Optional[np.ndarray] = None
+_ego_pose_cam_R: Optional[np.ndarray] = None   # R: ego frame → camera frame (3×3)
+_ego_pose_cam_t: Optional[np.ndarray] = None   # t: sensor position in ego frame (3,)
+ 
+def _quat_to_rotmat(q):
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return np.array([
+        [1-2*(y*y+z*z),  2*(x*y-w*z),    2*(x*z+w*y)],
+        [2*(x*y+w*z),    1-2*(x*x+z*z),  2*(y*z-w*x)],
+        [2*(x*z-w*y),    2*(y*z+w*x),    1-2*(x*x+y*y)],
+    ], dtype=np.float64)
 
+def set_ego_poses(
+    poses: List[Dict],
+    cam_intrinsic: List[List[float]],
+    cam_rotation_quat,
+    cam_translation,
+):
+    #Load NuScenes ground-truth ego-pose data.
+    global _ego_poses, _ego_pose_cam_K, _ego_pose_cam_R, _ego_pose_cam_t
+    _ego_poses      = poses
+    _ego_pose_cam_K = np.array(cam_intrinsic, dtype=np.float64)
+    _ego_pose_cam_R = _quat_to_rotmat(cam_rotation_quat)
+    _ego_pose_cam_t = np.array(cam_translation, dtype=np.float64)
+    print(f"✅ Ego-pose GMC loaded ({len(poses)} keyframes)")
 def reset_gmc():
-    global _prev_gray_small, _cumulative_tx, _cumulative_ty
-    _prev_gray_small = None
-    _cumulative_tx = 0.0
-    _cumulative_ty = 0.0
+    global _cumulative_tx, _cumulative_ty, _frame_gmc_M_inv
+    _cumulative_tx    = 0.0
+    _cumulative_ty    = 0.0
+    _frame_gmc_M_inv  = None
 
 
-def compute_gmc(frame_bgr: np.ndarray) -> Tuple[float, float]:
+def compute_gmc(frame_idx: int = 0) -> Tuple[float, float, float, float]:
     """
-    Estimate camera translation (tx, ty) between this frame and the previous one.
-    Returns (0, 0) on the first frame or if GMC is disabled.
+    Ego-pose-based Global Motion Compensation for NuScenes scenes.
+    Builds a rotation-only homography from the ego-pose quaternions and stores
+    the inverse in _frame_gmc_M_inv for compensate_bbox / add_observation.
     """
-    global _prev_gray_small, _cumulative_tx, _cumulative_ty
-    if not GMC_ENABLED:
-        return 0.0, 0.0
+    global _cumulative_tx, _cumulative_ty, _frame_gmc_M_inv
 
-    h, w = frame_bgr.shape[:2]
-    small = cv2.resize(frame_bgr, (int(w * GMC_SCALE), int(h * GMC_SCALE)))
-    gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    if _ego_poses is None or frame_idx == 0 or frame_idx >= len(_ego_poses):
+        _frame_gmc_M_inv = None
+        return 0.0, 0.0, _cumulative_tx, _cumulative_ty
 
-    if _prev_gray_small is None:
-        _prev_gray_small = gray
-        return 0.0, 0.0
+    pose1 = _ego_poses[frame_idx - 1]
+    pose2 = _ego_poses[frame_idx]
 
-    flow = cv2.calcOpticalFlowFarneback(
-        _prev_gray_small, gray,
-        None,
-        pyr_scale=0.5, levels=3, winsize=15,
-        iterations=3, poly_n=5, poly_sigma=1.2,
-        flags=0
-    )
-    _prev_gray_small = gray
+    R_w_e1 = _quat_to_rotmat(pose1["rotation"])
+    R_w_e2 = _quat_to_rotmat(pose2["rotation"])
 
-    # Median flow vector → robust global translation estimate
-    tx_small = float(np.median(flow[..., 0]))
-    ty_small = float(np.median(flow[..., 1]))
+    # Camera orientation in world frame
+    R_w_c1 = R_w_e1 @ _ego_pose_cam_R
+    R_w_c2 = R_w_e2 @ _ego_pose_cam_R
 
-    # Scale back to original resolution
-    tx = tx_small / GMC_SCALE
-    ty = ty_small / GMC_SCALE
-    return tx, ty
+    # Relative rotation: cam2 → cam1  (exact for background at optical infinity)
+    R_c2_to_c1 = R_w_c1.T @ R_w_c2
+
+    K     = _ego_pose_cam_K
+    K_inv = np.linalg.inv(K)
+
+    # 3×3 rotation homography mapping current pixels → previous pixels
+    H_bwd = K @ R_c2_to_c1 @ K_inv
+
+    denom = H_bwd[2, 2]
+    if abs(denom) < 1e-9:
+        _frame_gmc_M_inv = None
+        return 0.0, 0.0, _cumulative_tx, _cumulative_ty
+
+    _frame_gmc_M_inv = H_bwd / denom          # shape (3, 3)
+
+    # Apparent pixel shift of the principal point (for cumulative offset display)
+    cx, cy = K[0, 2], K[1, 2]
+    pt     = H_bwd @ np.array([cx, cy, 1.0])
+    pt    /= pt[2]
+    tx = cx - float(pt[0])
+    ty = cy - float(pt[1])
+
+    _cumulative_tx += tx
+    _cumulative_ty += ty
+
+    return tx, ty, _cumulative_tx, _cumulative_ty
 
 
-def compensate_bbox(bbox: Dict, tx: float, ty: float) -> Dict:
-    """Subtract camera motion from a bounding box."""
-    if tx == 0.0 and ty == 0.0:
+def compensate_bbox(bbox: Dict, M_inv: Optional[np.ndarray]) -> Dict:
+    """
+    Apply the inverse camera-motion homography to a bbox so ByteTracker's IoU
+    matching works in a stable (previous-frame) coordinate system.
+
+    M_inv is a 3×3 homography → must perspective-divide by the w-component.
+    """
+    if M_inv is None:
         return bbox
+
+    corners = np.array([
+        [bbox["x1"], bbox["y1"], 1.0],
+        [bbox["x2"], bbox["y1"], 1.0],
+        [bbox["x2"], bbox["y2"], 1.0],
+        [bbox["x1"], bbox["y2"], 1.0],
+    ])  # (4, 3)
+
+    warped_h = (M_inv @ corners.T).T            # (4, 3) homogeneous
+    w_col    = warped_h[:, 2:3]
+    w_col    = np.where(np.abs(w_col) < 1e-9, 1e-9, w_col)
+    warped   = warped_h[:, :2] / w_col          # (4, 2) Euclidean
+
     return {
-        "x1": bbox["x1"] - tx,
-        "y1": bbox["y1"] - ty,
-        "x2": bbox["x2"] - tx,
-        "y2": bbox["y2"] - ty,
+        "x1": int(warped[:, 0].min()),
+        "y1": int(warped[:, 1].min()),
+        "x2": int(warped[:, 0].max()),
+        "y2": int(warped[:, 1].max()),
     }
-
-
-# ── Core per-frame function ───────────────────────────────────────────────────
+ 
+# Core per-frame function 
 def run_yolo_and_track(
     frame_bgr: np.ndarray,
     frame_idx: int,
@@ -309,50 +666,36 @@ def run_yolo_and_track(
     {
       "frame": frame_idx,
       "gmc_tx": float, "gmc_ty": float,
-      "scene_summary": {
-          "total_vehicles_detected": int,
-          ...
-          "detected_objects": [
-              {
-                "id": int,           # YOLO local detection id
-                "track_id": int,     # ByteTracker persistent id
-                "type": str,
-                "confidence": float,
-                "color": str,        # HSV pixel color (locked or best-guess)
-                "position": str,
-                "area": int,
-                "bounding_box": {"x1","y1","x2","y2"},
-                "speed": str,
-                "direction": str,
-              }, ...
-          ]
-      }
+      "gmc_cum_tx": float, "gmc_cum_ty": float,
+      "scene_summary": { ... }
     }
     """
     import supervision as sv
 
-    model = get_yolo()
+    model   = get_yolo()
     tracker = get_tracker()
 
     h_orig, w_orig = frame_bgr.shape[:2]
     scale  = min(YOLO_INPUT_MAX_DIM / max(h_orig, w_orig), 1.0)
     small  = cv2.resize(frame_bgr, (int(w_orig * scale), int(h_orig * scale)))
-    h, w   = small.shape[:2]
 
-    # ── GMC ──────────────────────────────────────────────────────────────────
-    tx, ty = compute_gmc(frame_bgr)
+    #  GMC: returns per-frame delta AND cumulative offset 
+    tx, ty, cum_tx, cum_ty = compute_gmc(frame_idx)
 
-    # ── YOLO ─────────────────────────────────────────────────────────────────
+    #  YOLO detection 
     vehicle_count       = 0
     pedestrian_count    = 0
     cyclist_count       = 0
     traffic_light_count = 0
 
-    boxes_raw, confidences_raw, class_ids_raw = [], [], []
-    obj_types_raw, bboxes_raw = [], []
+    boxes_raw: List[List[int]]  = []
+    confidences_raw: List[float] = []
+    class_ids_raw: List[int]    = []
+    obj_types_raw: List[str]    = []
+    bboxes_raw: List[Dict]      = []  
 
     if model:
-        results = model(small, conf=YOLO_CONF_THRESH, verbose=False)
+        results = model(small, conf=YOLO_CONF_THRESH, imgsz=YOLO_IMGSZ, verbose=False)
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cls_id     = int(box.cls[0])
@@ -364,34 +707,41 @@ def run_yolo_and_track(
                 continue
 
             sem_type = _semantic_type(cls_name)
-            if sem_type in VEHICLE_CLASSES:    vehicle_count += 1
-            elif sem_type == "cyclist":        cyclist_count += 1
-            elif sem_type == "pedestrian":     pedestrian_count += 1
+            if sem_type in VEHICLE_CLASSES:    vehicle_count      += 1
+            elif sem_type == "cyclist":        cyclist_count      += 1
+            elif sem_type == "pedestrian":     pedestrian_count   += 1
             elif sem_type == "traffic_light":  traffic_light_count += 1
-
             bbox_orig = {
                 "x1": int(x1 / scale), "y1": int(y1 / scale),
                 "x2": int(x2 / scale), "y2": int(y2 / scale),
             }
-            bbox_gmc  = compensate_bbox(bbox_orig, tx, ty)
+            # GMC-compensated bbox for stable IoU matching in ByteTracker
+            bbox_gmc  = compensate_bbox(bbox_orig, _frame_gmc_M_inv)
 
             boxes_raw.append([bbox_gmc["x1"], bbox_gmc["y1"],
                                bbox_gmc["x2"], bbox_gmc["y2"]])
             confidences_raw.append(min(1.0, max(0.0, confidence)))
             class_ids_raw.append(cls_id)
             obj_types_raw.append(sem_type)
-            bboxes_raw.append(bbox_orig)  # keep original (not compensated) for display
+            bboxes_raw.append(bbox_orig)
 
-    # ── ByteTracker update ────────────────────────────────────────────────────
-    tracked_objects = []
+    # ByteTracker update 
+    tracked_objects: List[Dict] = []
 
     if tracker and boxes_raw:
         detections = sv.Detections(
-            xyxy       = np.array(boxes_raw, dtype=np.float32),
+            xyxy       = np.array(boxes_raw,       dtype=np.float32),
             confidence = np.array(confidences_raw, dtype=np.float32),
-            class_id   = np.array(class_ids_raw, dtype=np.int32),
+            class_id   = np.array(class_ids_raw,   dtype=np.int32),
         )
         detections.data["object_type"] = obj_types_raw
+        gmc_cx_to_orig: Dict[Tuple[int, int], List[Dict]] = {}
+        for gmc_box, orig_bbox in zip(boxes_raw, bboxes_raw):
+            key = (
+                int((gmc_box[0] + gmc_box[2]) / 2),
+                int((gmc_box[1] + gmc_box[3]) / 2),
+            )
+            gmc_cx_to_orig.setdefault(key, []).append(orig_bbox)
 
         detections = tracker.update_with_detections(detections)
 
@@ -402,31 +752,59 @@ def run_yolo_and_track(
             obj_type = (detections.data["object_type"][i]
                         if "object_type" in detections.data else "unknown")
 
-            # Re-map tracked box back to original (uncompensated) coords for display
-            # Use bboxes_raw if index aligns; otherwise use tracked box
-            if i < len(bboxes_raw):
-                bbox = bboxes_raw[i]
+            tracked_cx = int((box[0] + box[2]) / 2)
+            tracked_cy = int((box[1] + box[3]) / 2)
+            best_key   = min(
+                gmc_cx_to_orig.keys(),
+                key=lambda k: math.hypot(k[0] - tracked_cx, k[1] - tracked_cy),
+                default=None,
+            )
+            if best_key is not None:
+                euclidean = math.hypot(
+                    best_key[0] - tracked_cx, best_key[1] - tracked_cy
+                )
+                if euclidean < 50.0:  
+                    candidates = gmc_cx_to_orig[best_key]
+                    bbox = candidates.pop(0)
+                    if not candidates:
+                        del gmc_cx_to_orig[best_key]
+                else:
+                    bbox = {
+                        "x1": int(box[0] + tx), "y1": int(box[1] + ty),
+                        "x2": int(box[2] + tx), "y2": int(box[3] + ty),
+                    }
             else:
-                bbox = {"x1": int(box[0]), "y1": int(box[1]),
-                        "x2": int(box[2]), "y2": int(box[3])}
+                bbox = {
+                    "x1": int(box[0] + tx), "y1": int(box[1] + ty),
+                    "x2": int(box[2] + tx), "y2": int(box[3] + ty),
+                }
 
-            # ── Pixel color (skip for pedestrians) ───────────────────────
             is_pedestrian = obj_type == "pedestrian"
-            pixel_color = "unknown" if is_pedestrian else extract_dominant_color(frame_bgr, bbox)
-
-            # ── Track state update ────────────────────────────────────────
+            pixel_color, color_conf = (
+                ("unknown", 0.0) if is_pedestrian
+                else extract_dominant_color_clip(
+                    frame_bgr, bbox, obj_type,
+                    other_bboxes=[b for b in bboxes_raw if b is not bbox],
+                )
+            )
             state = _get_or_create_state(track_id, obj_type)
-            state.add_observation(frame_idx, bbox, pixel_color)
-
-            # ── Position label ────────────────────────────────────────────
-            cx = (bbox["x1"] + bbox["x2"]) / 2
-            horizontal = ("Left"   if cx < w_orig * 0.40 else
-                          "Right"  if cx > w_orig * 0.60 else "Center")
-            cy_px = (bbox["y1"] + bbox["y2"]) / 2
+            state.add_observation(
+                frame_idx, bbox, pixel_color,
+                color_confidence=color_conf,
+                cum_tx=cum_tx, cum_ty=cum_ty,
+                frame_M_inv=_frame_gmc_M_inv,
+            )
+            cx_px = (bbox["x1"] + bbox["x2"]) / 2
+            horizontal = (
+                "Left"   if cx_px < w_orig * 0.40 else
+                "Right"  if cx_px > w_orig * 0.60 else
+                "Center"
+            )
+            cy_px  = (bbox["y1"] + bbox["y2"]) / 2
             depth  = "Foreground" if cy_px > h_orig * 0.50 else "Background"
             position = f"{depth} {horizontal}"
 
-            obj_entry = {
+            obj_entry: Dict = {
                 "id":           i + 1,
                 "track_id":     track_id,
                 "type":         obj_type,
@@ -439,21 +817,29 @@ def run_yolo_and_track(
             }
             if not is_pedestrian:
                 obj_entry["color"] = state.color
-            # Size for vehicles and cyclists only
             if obj_type in VEHICLE_CLASSES or obj_type == "cyclist":
                 obj_entry["size"] = _size_label(bbox, w_orig, h_orig)
             tracked_objects.append(obj_entry)
 
     elif not tracker and boxes_raw:
-        # Fallback: no tracker, just enumerate detections
+        # Fallback: no ByteTracker — basic detection only
         for i, (bbox, conf, obj_type) in enumerate(
                 zip(bboxes_raw, confidences_raw, obj_types_raw)):
             is_pedestrian = obj_type == "pedestrian"
-            pixel_color = "unknown" if is_pedestrian else extract_dominant_color(frame_bgr, bbox)
-            cx = (bbox["x1"] + bbox["x2"]) / 2
-            horizontal = ("Left"   if cx < w_orig * 0.40 else
-                          "Right"  if cx > w_orig * 0.60 else "Center")
-            cy_px = (bbox["y1"] + bbox["y2"]) / 2
+            pixel_color, _color_conf = (
+                ("unknown", 0.0) if is_pedestrian
+                else extract_dominant_color_clip(
+                    frame_bgr, bbox, obj_type,
+                    other_bboxes=[b for b in bboxes_raw if b is not bbox],
+                )
+            )
+            cx_px = (bbox["x1"] + bbox["x2"]) / 2
+            horizontal = (
+                "Left"   if cx_px < w_orig * 0.40 else
+                "Right"  if cx_px > w_orig * 0.60 else
+                "Center"
+            )
+            cy_px  = (bbox["y1"] + bbox["y2"]) / 2
             depth  = "Foreground" if cy_px > h_orig * 0.50 else "Background"
             obj_entry = {
                 "id":           i + 1,
@@ -473,16 +859,18 @@ def run_yolo_and_track(
             tracked_objects.append(obj_entry)
 
     output = {
-        "frame": frame_idx,
-        "gmc_tx": round(tx, 2),
-        "gmc_ty": round(ty, 2),
+        "frame":      frame_idx,
+        "gmc_tx":     round(tx,     2),
+        "gmc_ty":     round(ty,     2),
+        "gmc_cum_tx": round(cum_tx, 2),
+        "gmc_cum_ty": round(cum_ty, 2),
         "scene_summary": {
             "total_vehicles_detected":       vehicle_count,
             "total_pedestrians_detected":    pedestrian_count,
             "total_cyclists_detected":       cyclist_count,
             "total_traffic_lights_detected": traffic_light_count,
             "detected_objects":              tracked_objects,
-        }
+        },
     }
 
     if out_json_path:
@@ -493,44 +881,172 @@ def run_yolo_and_track(
     return output
 
 
-# ── Annotated canvas (for saving debug images) ────────────────────────────────
+#  Annotated imgs
 def draw_tracks(frame_bgr: np.ndarray, frame_data: Dict) -> np.ndarray:
-    """Draw bounding boxes + track IDs only (clean version for user-facing images)."""
     canvas = frame_bgr.copy()
     font   = cv2.FONT_HERSHEY_SIMPLEX
     for obj in frame_data.get("scene_summary", {}).get("detected_objects", []):
         bb  = obj["bounding_box"]
         tid = obj.get("track_id", obj["id"])
+        oid = obj.get("id", "?")
         x1, y1, x2, y2 = bb["x1"], bb["y1"], bb["x2"], bb["y2"]
-
-        # Draw bounding box (white outline)
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
-
-        # Draw track ID label only
-        label = f"#{tid}"
-        (tw, th), _ = cv2.getTextSize(label, font, 0.55, 1)
+        label = f"t{tid} o{oid}"
+        (tw, th), _ = cv2.getTextSize(label, font, 0.50, 1)
         ly = y1 - 8 if y1 > 20 else y1 + th + 8
         cv2.rectangle(canvas, (x1, ly - th - 4), (x1 + tw + 6, ly + 4), (0, 0, 0), -1)
-        cv2.putText(canvas, label, (x1 + 3, ly), font, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, label, (x1 + 3, ly), font, 0.50,
+                    (255, 255, 255), 1, cv2.LINE_AA)
     return canvas
 
 
-# ── Full-video pipeline ───────────────────────────────────────────────────────
-def process_video_frames(
-    video_path: str,
-    out_dir: str = "output",
-    frame_rate: int = TRACKER_FRAME_RATE,
+def process_scene_sweeps(
+    scene_name: str,
+    dataroot: str = NUSCENES_DATAROOT,
+    out_dir:  str = "output",
+    camera:   str = "CAM_FRONT",
 ) -> Tuple[int, int]:
     """
-    Run YOLO + GMC + ByteTracker on every Nth frame of a video.
+    Process a NuScenes scene at native sweep rate (~12 Hz) through YOLO +
+    ByteTracker, reading JPGs directly from the SDK (no mp4, no cv2 seek).
 
-    Writes:
-      output/frames/frame_{idx:06d}.json        — per-frame JSON (track_id, color, size, motion)
-      output/annotated/frame_{idx:06d}_track.jpg — user-facing image (boxes + IDs only)
-
-    Returns:
-      (total_frames_written, video_duration_seconds)
+    Per-frame detections are written for every sweep so tracking has dense
+    motion data; a separate keyframes/ directory holds only sample-aligned
+    frames (2 Hz) for the downstream Qwen annotation pipeline. A
+    keyframe_map.json links sweep frame_idx ↔ sample_idx ↔ sample_token.
     """
+    global _tracker_actual_fps
+
+    import shutil
+    if not NUSCENES_AVAILABLE:
+        raise RuntimeError("nuScenes SDK not available")
+
+    frames_dir    = os.path.join(out_dir, "frames")
+    annotated_dir = os.path.join(out_dir, "annotated")
+    keyframes_dir = os.path.join(out_dir, "keyframes")
+    for d in (frames_dir, annotated_dir, keyframes_dir):
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+
+    nusc  = _init_nuscenes_sdk(dataroot)
+    scene = next((s for s in nusc.scene if scene_name in s["name"]), None)
+    if scene is None:
+        raise ValueError(f"Scene '{scene_name}' not found in {dataroot}")
+
+    # Walk CAM sample_data chain: 12 Hz mix of samples (is_key_frame=True) + sweeps
+    first_sample = nusc.get("sample", scene["first_sample_token"])
+    sd_token     = first_sample["data"][camera]
+    sd_records   = []
+    while sd_token:
+        sd = nusc.get("sample_data", sd_token)
+        sd_records.append(sd)
+        sd_token = sd["next"]
+
+    n_total     = len(sd_records)
+    n_keyframes = sum(1 for sd in sd_records if sd["is_key_frame"])
+
+    # Native fps from timestamps (microseconds)
+    t_first       = sd_records[0]["timestamp"]
+    t_last        = sd_records[-1]["timestamp"]
+    duration_secs = max(1e-6, (t_last - t_first) / 1e6)
+    actual_fps    = n_total / duration_secs
+
+    print(f"\n{'='*55}")
+    print(f"  Scene             : {scene['name']}")
+    print(f"  Camera            : {camera}")
+    print(f"  Total frames      : {n_total}  ({n_keyframes} keyframes)")
+    print(f"  Duration          : {duration_secs:.1f}s @ {actual_fps:.2f} fps")
+    print(f"{'='*55}\n")
+
+    # Camera calibration & full 12 Hz ego-pose list (one per sample_data record)
+    calib     = nusc.get("calibrated_sensor", sd_records[0]["calibrated_sensor_token"])
+    ego_poses = [nusc.get("ego_pose", sd["ego_pose_token"]) for sd in sd_records]
+
+    _tracker_actual_fps = actual_fps
+    reset_tracker(int(round(actual_fps)))
+    reset_track_states()
+    reset_gmc()
+    set_ego_poses(
+        ego_poses,
+        cam_intrinsic     = calib["camera_intrinsic"],
+        cam_rotation_quat = calib["rotation"],
+        cam_translation   = calib["translation"],
+    )
+
+    # Sample-rate annotations (for downstream GT validation at keyframes)
+    load_nuscenes_scene(scene_name, dataroot)
+
+    keyframe_map: List[Dict] = []
+    sample_idx               = 0
+
+    for frame_idx, sd in enumerate(sd_records):
+        img_path = os.path.join(dataroot, sd["filename"])
+        frame    = cv2.imread(img_path)
+        if frame is None:
+            print(f"  ⚠ could not read {img_path}")
+            continue
+
+        json_path = os.path.join(frames_dir,    f"frame_{frame_idx:06d}.json")
+        jpg_path  = os.path.join(annotated_dir, f"frame_{frame_idx:06d}_track.jpg")
+
+        data = run_yolo_and_track(frame, frame_idx, out_json_path=None)
+        data["is_keyframe"] = bool(sd["is_key_frame"])
+        data["timestamp"]   = sd["timestamp"]
+        if sd["is_key_frame"]:
+            data["sample_token"] = sd["sample_token"]
+            data["sample_idx"]   = sample_idx
+
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        canvas = draw_tracks(frame, data)
+        cv2.imwrite(jpg_path, canvas)
+
+        if sd["is_key_frame"]:
+            # Sample-aligned copy for Qwen / annotation pipeline
+            kf_path = os.path.join(keyframes_dir, f"keyframe_{sample_idx:04d}.json")
+            with open(kf_path, "w") as f:
+                json.dump(data, f, indent=2)
+            keyframe_map.append({
+                "sample_idx":   sample_idx,
+                "frame_idx":    frame_idx,
+                "sample_token": sd["sample_token"],
+                "timestamp":    sd["timestamp"],
+            })
+            sample_idx += 1
+
+        n      = len(data["scene_summary"]["detected_objects"])
+        marker = " [KEY]" if sd["is_key_frame"] else ""
+        print(
+            f"  Frame {frame_idx:06d}: {n} tracked | "
+            f"GMC ({data['gmc_tx']:+.1f}, {data['gmc_ty']:+.1f}){marker}"
+        )
+
+    with open(os.path.join(out_dir, "keyframe_map.json"), "w") as f:
+        json.dump(keyframe_map, f, indent=2)
+
+    global_summary = get_track_motion_summary(0, int(duration_secs) + 1)
+    summary_path   = os.path.join(out_dir, "tracks_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(global_summary, f, indent=2)
+
+    print(f"\n✅ Processed {n_total} sweeps ({n_keyframes} keyframes)")
+    print(f"   Per-sweep:  {frames_dir}/")
+    print(f"   Annotated:  {annotated_dir}/")
+    print(f"   Keyframes:  {keyframes_dir}/  (sample-aligned for Qwen)")
+    print(f"   Summary:    {summary_path}")
+
+    return n_total, int(duration_secs)
+
+
+def process_video_frames(
+    video_path: str,
+    out_dir: str    = "output",
+    frame_rate: int = TRACKER_FRAME_RATE,
+) -> Tuple[int, int]:
+    global _tracker_actual_fps
+
     import shutil
     frames_dir    = os.path.join(out_dir, "frames")
     annotated_dir = os.path.join(out_dir, "annotated")
@@ -544,27 +1060,52 @@ def process_video_frames(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
-
     fps           = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_secs = max(1, int(total_frames / fps))
-
-    # Auto frame-rate: if 0, sample at 0.5x video_fps, but never drop below 15 FPS (unless video < 15 FPS)
-    actual_rate = frame_rate if frame_rate > 0 else min(int(fps), max(15, int(math.floor(fps * 0.5))))
+    actual_rate = float(frame_rate) if frame_rate > 0 else fps
     step_float  = fps / actual_rate
-
+    _tracker_actual_fps = actual_rate
+    sampling_mode = "all frames" if frame_rate == 0 else f"{actual_rate:.2f} fps"
     print(f"\n{'='*55}")
     print(f"  Video original FPS : {fps:.2f} fps")
-    print(f"  Sampling at        : {actual_rate:.2f} fps  (step size: {step_float:.2f} frames)")
-    print(f"  Duration           : {duration_secs}s  |  ~{int(duration_secs * actual_rate)} frames to process")
+    print(f"  Processing        : {sampling_mode}  (step: {step_float:.2f} frames)")
+    print(f"  Duration           : {duration_secs}s  |  ~{int(duration_secs * actual_rate)} frames")
     print(f"{'='*55}\n")
 
-    # Fresh state for new video
     reset_tracker(int(actual_rate))
     reset_track_states()
     reset_gmc()
 
-    frames_written = 0
+    #Load NuScenes data
+    scene_name = os.path.basename(os.path.dirname(video_path))  # e.g., 'scene-0103'
+    nuscenes_loaded = load_nuscenes_scene(scene_name, dataroot=NUSCENES_DATAROOT)
+    
+    # If NuScenes scene loaded with ego-pose data, initialize ego-pose GMC
+    if nuscenes_loaded and _nusc_frame_data and _nusc is not None:
+        try:
+            ego_poses = [_nusc_frame_data[i]["ego_pose"] for i in sorted(_nusc_frame_data.keys())]
+            
+            # Get camera calibration from SDK (CAM_FRONT)
+            # Find first sample with CAM_FRONT data
+            for scene in _nusc.scene:
+                if scene_name in scene["name"]:
+                    first_sample = _nusc.get("sample", scene["first_sample_token"])
+                    cam_data = _nusc.get("sample_data", first_sample["data"]["CAM_FRONT"])
+                    calib = _nusc.get("calibrated_sensor", cam_data["calibrated_sensor_token"])
+                    
+                    set_ego_poses(
+                        ego_poses,
+                        cam_intrinsic=calib["camera_intrinsic"],
+                        cam_rotation_quat=calib["rotation"],
+                        cam_translation=calib["translation"],
+                    )
+                    print(f"✅ Initialized ego-pose GMC with {len(ego_poses)} poses")
+                    break
+        except Exception as e:
+            print(f"⚠   Could not load ego-pose GMC: {e}")
+
+    frames_written    = 0
     current_float_idx = 0.0
 
     while current_float_idx < total_frames:
@@ -577,88 +1118,90 @@ def process_video_frames(
         json_path = os.path.join(frames_dir,    f"frame_{frame_idx:06d}.json")
         jpg_path  = os.path.join(annotated_dir, f"frame_{frame_idx:06d}_track.jpg")
 
-        data = run_yolo_and_track(frame, frame_idx, out_json_path=json_path)
-
-        # Save annotated user-facing image
+        data   = run_yolo_and_track(frame, frame_idx, out_json_path=json_path)
         canvas = draw_tracks(frame, data)
         cv2.imwrite(jpg_path, canvas)
 
         n = len(data["scene_summary"]["detected_objects"])
-        print(f"  Frame {frame_idx:06d}: {n} tracked objects | GMC ({data['gmc_tx']:+.1f}, {data['gmc_ty']:+.1f})")
+        print(
+            f"  Frame {frame_idx:06d}: {n} tracked objects | "
+            f"GMC frame ({data['gmc_tx']:+.1f}, {data['gmc_ty']:+.1f}) | "
+            f"cumulative ({data['gmc_cum_tx']:+.1f}, {data['gmc_cum_ty']:+.1f})"
+        )
 
-        frames_written += 1
+        frames_written    += 1
         current_float_idx += step_float
 
     cap.release()
-    print(f"\u2705 Processed {frames_written} frames \u2192 {frames_dir}/ | {annotated_dir}/")
+    print(f"✅ Processed {frames_written} frames → {frames_dir}/ | {annotated_dir}/")
 
-    # Generate and save a single global tracker summary JSON for the whole video
-    global_summary = get_track_motion_summary(0, int(duration_secs) + 1, fps=actual_rate)
-    summary_path = os.path.join(out_dir, "tracks_summary.json")
+    global_summary = get_track_motion_summary(0, int(duration_secs) + 1)
+    summary_path   = os.path.join(out_dir, "tracks_summary.json")
     with open(summary_path, "w") as f:
         json.dump(global_summary, f, indent=2)
-    print(f"  \u2705 Saved full track summary to: {summary_path}")
+    print(f"  ✅ Saved full track summary: {summary_path}")
 
     return frames_written, duration_secs
-
-
-# ── Cumulative motion summary (used by scene_annotator) ──────────────────────
+#  Cumulative motion summary 
 def get_track_motion_summary(
     span_start_sec: int,
     span_end_sec: int,
     fps: Optional[float] = None,
 ) -> List[Dict]:
-    """
-    Return a list of motion summaries for tracks that were active in the span.
-    Uses the in-memory _track_states built during process_video_frames().
-    Falls back to reading tracks.json if called post-hoc.
-    """
-    actual_fps = fps if fps is not None else float(_tracker_frame_rate)
-    if actual_fps <= 0:
-        actual_fps = 25.0  # Safe fallback if never initialized
 
-    summaries = []
+    if fps is not None:
+        actual_fps = fps
+    elif _tracker_actual_fps > 0:
+        actual_fps = _tracker_actual_fps
+    elif _tracker_frame_rate > 0:
+        actual_fps = float(_tracker_frame_rate)
+    else:
+        actual_fps = 25.0 
+
+    summaries   = []
     start_frame = int(span_start_sec * actual_fps)
     end_frame   = int(span_end_sec   * actual_fps)
 
     for tid, state in _track_states.items():
-        active_frames = [
+        active = [
             (fi, pos)
             for fi, pos in zip(state.frame_indices, state.positions)
             if start_frame <= fi <= end_frame
         ]
-        if not active_frames:
+        if not active:
             continue
 
-        indices = [af[0] for af in active_frames]
-        positions = [af[1] for af in active_frames]
+        indices   = [a[0] for a in active]
+        positions = [a[1] for a in active]
 
+        dist = 0.0
         if len(positions) >= 2:
-            dx = positions[-1][0] - positions[0][0]
-            dy = positions[-1][1] - positions[0][1]
+            dx   = positions[-1][0] - positions[0][0]
+            dy   = positions[-1][1] - positions[0][1]
             dist = math.hypot(dx, dy)
-        else:
-            dist = 0.0
 
-        summaries.append({
-            "track_id":        tid,
-            "object_type":     state.obj_type,
-            "color":           state.color,
-            "speed":           state.speed_label(),
-            "direction":       state.direction_label(),
-            "distance_px":     round(dist, 1),
-            "frame_span":      [indices[0], indices[-1]],
+        summary: Dict = {
+            "track_id":         tid,
+            "object_type":      state.obj_type,
+            "speed":            state.speed_label(),
+            "direction":        state.direction_label(),
+            "distance_px":      round(dist, 1),
+            "frame_span":       [indices[0], indices[-1]],
             "evidence_seconds": sorted(set(int(fi / actual_fps) for fi in indices)),
-        })
+        }
+        if state.obj_type != "pedestrian":
+            summary["color"] = state.color
+        summaries.append(summary)
     return summaries
-
-
-# ── Standalone entry point ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    target = TARGET_FILE
-    process_video_frames(target, out_dir="output", frame_rate=TRACKER_FRAME_RATE)
+    # Sweep-rate (~12 Hz) tracking on NuScenes; downstream Qwen consumes the
+    # sample-aligned keyframes/ output (2 Hz).
+    process_scene_sweeps(TARGET_SCENE, dataroot=NUSCENES_DATAROOT, out_dir="output")
     summary = get_track_motion_summary(0, 9999)
     print(f"\nMotion summary ({len(summary)} tracks):")
     for s in summary[:10]:
-        print(f"  Track {s['track_id']} ({s['color']} {s['object_type']}): "
-              f"{s['direction']} @ {s['speed']} | {s['distance_px']:.0f}px")
+        color_str = s.get("color", "n/a")
+        print(
+            f"  Track {s['track_id']} ({color_str} {s['object_type']}): "
+            f"{s['direction']} @ {s['speed']} | {s['distance_px']:.0f}px"
+        )

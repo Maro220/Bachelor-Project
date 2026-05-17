@@ -1,36 +1,45 @@
-
 import base64
 import math
 import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import traceback
+
+import whisper
 from datetime import datetime
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
 
+load_dotenv()
 import cv2
-import numpy as np
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
 try:
     from yolo_bytetrack import (
         run_yolo_and_track,
         process_video_frames,
+        process_scene_sweeps,
         get_track_motion_summary,
         reset_tracker,
         draw_tracks,
+        set_ego_poses,
         TRACKER_FRAME_RATE,
+        NUSCENES_DATAROOT,
         VIDEO_CHUNK_SECONDS as _YBT_CHUNK,
     )
     TRACKER_AVAILABLE = True
 except Exception as e:
-    print(f"⚠  yolo_bytetrack import failed: {e}")
+    print(f"yolo_bytetrack import failed: {e}")
     TRACKER_AVAILABLE = False
     run_yolo_and_track = None
     process_video_frames = None
+    process_scene_sweeps = None
     get_track_motion_summary = None
+    NUSCENES_DATAROOT = "data/v1.0-mini"
 
 try:
     from google.oauth2 import service_account
@@ -51,149 +60,168 @@ except ImportError:
     print("ultralytics not installed. Skipping YOLO detection.")
 
 OLLAMA_URL       = "http://localhost:11434/api/chat"
-VISION_MODEL     = "qwen2.5vl:7b"
-TEXT_MODEL       = "qwen2.5:3b"
+MODEL     = "qwen2.5vl:7b"
 CREDENTIALS_FILE = "credentials.json"
 OAUTH_FILE       = "oauth_client.json"
 TOKEN_FILE       = "token.json"
 SHEET_ID_FILE    = "spreadsheet_id.txt"
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVER_PORT      = 7860
-DEFAULT_TARGET   = "assets/7.mp4"
-TOP_N_OBJECTS_FOR_GAP_FILL = 3
-# Frame/tracking constants live in yolo_bytetrack.py — imported here for use
+DEFAULT_SCENE    = "scene-0757"   # NuScenes scene name (sweep-based pipeline; no path)
+DEFAULT_TARGET   = f"output_nuscenes/{DEFAULT_SCENE}/{DEFAULT_SCENE}_CAM_FRONT.mp4"  # mp4 path used ONLY by /video/preview in the form
 VIDEO_CHUNK_SECONDS = _YBT_CHUNK if TRACKER_AVAILABLE else 5
-
-
-CUMULATIVE_SUMMARY_SCHEMA = {
-    "annotator_type": "ai | human",
-    "scene_id": "",
-
-    "environment":    "urban street | highway | parking lot | intersection | residential area | school zone | construction zone",
-    "lighting":       "bright daylight | low-light | night with street lights | night without lighting",
-
-    "total_vehicles":         0,
-    "total_pedestrians":      0,
-    "total_cyclists":         0,
-    "total_traffic_lights":   0,
-
-    "traffic_density":  "empty | light | moderate | heavy | gridlock",
-    "traffic_flow":     "free-flowing | slow-moving | stopped | mixed | one-directional | bidirectional",
-
-    # ── Object groups
-    
-    "scene_narrative": "3–4 sentences describing the overall scene holistically: what kind of place, what is happening, what stands out.",
-    "hazards_and_events": "any safety concerns, unusual events, obstructions, or noteworthy observations. 'none' if absent.",
-    "spatial_description": "brief description of depth layers: what occupies foreground vs background, lane structure, sidewalks, etc.",
-    "annotation_confidence": None   # 0.0–1.0 for AI, null for human
-}
-
-#  Internal per-frame AI schema (for AI processing only) 
-# not used in the survey , it feeds the cumulative summary above.
-STATIC_SCHEMA = {
-    "frame": "static",
-    "scene_summary": {
-        "scene_description":             "",
-        "environment":                   "urban street / highway / parking lot / intersection / residential area / school zone / construction zone",
-        "lighting":                      "bright daylight / low-light / night with street lights / night without lighting",
-        "traffic_density":               "empty / light / moderate / heavy / gridlock",
-        "traffic_flow":                  "free-flowing / slow-moving / stopped / mixed / one-directional / bidirectional",
-        "total_vehicles_detected":       0,
-        "total_pedestrians_detected":    0,
-        "total_cyclists_detected":       0,
-        "total_traffic_lights_detected": 0,
-        "spatial_description":           "",
-        "hazards_and_events":            "",
-        "detected_objects": [
-            {
-                "object_id":   0,
-                "object_type": "type",
-                "color":       "color",
-                "size":        "small / medium / large",
-                "position":    "Foreground Left / Foreground Center / Foreground Right / Background Left / Background Center / Background Right",
-                "bounding_box_area": 0
-            }
-        ]
-    }
-}
-
-VIDEO_SCHEMA = {
-    "frame": 0,
-    "scene_summary": {
-        "scene_description":             "",
-        "environment":                   "urban street / highway / parking lot / intersection / residential area / school zone / construction zone",
-        "lighting":                      "bright daylight / low-light / night with street lights / night without lighting",
-        "traffic_density":               "empty / light / moderate / heavy / gridlock",
-        "traffic_flow":                  "free-flowing / slow-moving / stopped / mixed / one-directional / bidirectional",
-        "total_vehicles_detected":       0,
-        "total_pedestrians_detected":    0,
-        "total_cyclists_detected":       0,
-        "total_traffic_lights_detected": 0,
-        "spatial_description":           "",
-        "hazards_and_events":            "",
-        "detected_objects": [
-            {
-                "object_id":   0,
-                "object_type": "type",
-                "color":       "color",
-                "size":        "small / medium / large",
-                "position":    "Foreground Left / Foreground Center / Foreground Right / Background Left / Background Center / Background Right",
-                "action":      "parked / moving / turning / crossing / stopped / static",
-                "bounding_box_area": 0
-            }
-        ]
-    }
-}
-
-# AI cumulative (video only) — also maps to CUMULATIVE_SUMMARY_SCHEMA
-CUMULATIVE_AI_SCHEMA = {
-    "video_summary": {
-        "total_frames_analyzed":          0,
-        "environment":                    "",
-        "lighting":                       "",
-        "traffic_density":                "",
-        "traffic_flow":                   "",
-        "peak_vehicle_count":             0,
-        "peak_pedestrian_count":          0,
-        "avg_vehicle_count":              0,
-        "avg_pedestrian_count":           0,
-        "unique_object_types":            [],
-        "recurring_object_types":         [],
-        "spatial_description":            "",
-        "scene_narrative":                "",
-        "hazards_and_events":             "",
-        "annotation_confidence":          0.0
-    }
-}
 
 FIELD_OPTIONS = {
     "environment":    ["urban street", "highway", "parking lot", "intersection", "residential area", "school zone", "construction zone"],
     "lighting":       ["bright daylight", "low-light", "night with street lights", "night without lighting"],
     "traffic_density":["empty", "light", "moderate", "heavy", "gridlock"],
-    "traffic_flow":   ["free-flowing", "slow-moving", "stopped", "mixed", "one-directional", "bidirectional"],
+    "traffic_flow":   ["free-flowing", "slow-moving", "stopped", "mixed"],
 }
-
 OBJECT_TYPE_OPTIONS   = ["car", "van", "truck", "bus", "motorcycle", "cyclist", "pedestrian", "traffic_light", "road_sign", "other"]
-COLOR_OPTIONS         = ["white", "black", "silver", "gray", "red", "blue", "green", "yellow", "orange", "brown", "beige", "mixed"]
-SIZE_OPTIONS          = ["small (e.g. hatchback)", "medium (e.g. sedan/SUV)", "large (e.g. truck/bus)"]
-POSITION_OPTIONS      = ["Foreground Left", "Foreground Center", "Foreground Right",
-                         "Midground Left", "Midground Center", "Midground Right",
-                         "Background Left",  "Background Center",  "Background Right"]
-ACTION_OPTIONS        = ["moving", "parked", "stopped", "turning left", "turning right", "crossing", "static", "unknown"]
 VEHICLE_CLASSES       = {"car", "van", "motorcycle", "bus", "truck"}
-
 SHEET_HEADERS = [
-    "Annotator Type", "Participant ID", "Scene ID",
-    "Environment", "Lighting",
-    "Traffic Density", "Traffic Flow",
-    "Total Vehicles", "Total Pedestrians", "Total Cyclists",
+    "Annotator Type",      
+    "Participant Name",
+    "Country",
+    "Age Category",
+    "Gender",
+    "Profession",
+    "Driving Skill",
+    "Scene ID",
+    "Environment",
+    "Lighting",
+    "Traffic Density",
+    "Traffic Flow",
+    "Total Vehicles",
+    "Total Pedestrians",
+    "Total Cyclists",
     "Total Traffic Lights",
-    "Scene Narrative", "Hazards and Events",
-    "Object Count Summary"
+    "Scene Narrative",
+    "Hazards and Events",
+    "Video Review",
+    "Object Count Summary",
 ]
+_nuscenes_gt_by_frame: dict = {}  
+def set_nuscenes_gt(gt_data: dict):
+    global _nuscenes_gt_by_frame
+    _nuscenes_gt_by_frame = {
+        f["frame_video_idx"]: f
+        for f in gt_data.get("frames", [])
+    }
+    total_anns = sum(len(f.get("annotations", [])) for f in gt_data.get("frames", []))
+    print(f"✅ NuScenes GT loaded: {len(_nuscenes_gt_by_frame)} frames, "
+          f"{total_anns} total annotations")
+_NUSCENES_TO_YOLO_TYPE = {
+    "human.pedestrian.adult":              "pedestrian",
+    "human.pedestrian.child":              "pedestrian",
+    "human.pedestrian.wheelchair":         "pedestrian",
+    "human.pedestrian.stroller":           "pedestrian",
+    "human.pedestrian.personal_mobility":  "pedestrian",
+    "vehicle.car":                         "car",
+    "vehicle.truck":                       "truck",
+    "vehicle.bus.rigid":                   "bus",
+    "vehicle.bus.bendy":                   "bus",
+    "vehicle.motorcycle":                  "motorcycle",
+    "vehicle.bicycle":                     "cyclist",
+    "vehicle.trailer":                     "truck",
+    "vehicle.construction":                "truck",
+    "movable_object.trafficcone":          "other",
+    "movable_object.barrier":              "other",
+    "movable_object.pushable_pullable":    "other",
+    "static_object.bicycle_rack":          "other",
+}
+def _nuscenes_to_yolo_type(semantic_type: str) -> str:
+    return _NUSCENES_TO_YOLO_TYPE.get(semantic_type, "other")
+def inject_missed_gt_objects(yolo_data: dict, gt_annotations: list,
+                              frame_w: int, frame_h: int) -> dict:
+    """
+    Add GT-annotated objects that YOLO missed into the detection list.
+    Flagged as source='gt_injected' so downstream code knows provenance.
+    Only injects objects with visibility >= 2 (≥40% visible).
+    Uses IoU > 0.3 to avoid double-counting.
+    """
+    existing_bboxes = [
+        d["bounding_box"] for d in yolo_data["detections"]
+        if d.get("bounding_box")
+    ]
 
-# YOLO detection and tracking are handled by yolo_bytetrack.py.
-# Use run_yolo_and_track(frame, frame_idx) for per-frame detection+tracking.
+    injected = 0
+    for ann in gt_annotations:
+        if ann.get("visibility", 0) < 2:
+            continue
+
+        gt_bbox = ann.get("bbox_2d", {})
+        if not gt_bbox:
+            continue
+
+        already_detected = any(
+            _bbox_iou(gt_bbox, eb) > 0.3 for eb in existing_bboxes
+        )
+        if already_detected:
+            continue
+
+        cx         = (gt_bbox["x1"] + gt_bbox["x2"]) / 2
+        cy         = (gt_bbox["y1"] + gt_bbox["y2"]) / 2
+        horizontal = "Left" if cx < frame_w * 0.4 else "Right" if cx > frame_w * 0.6 else "Center"
+        depth      = "Foreground" if cy > frame_h * 0.5 else "Background"
+        yolo_type  = _nuscenes_to_yolo_type(ann["semantic_type"])
+
+        injected_obj = {
+            "id":           len(yolo_data["detections"]) + injected + 1,
+            "type":         yolo_type,
+            "confidence":   1.0,
+            "position":     f"{depth} {horizontal}",
+            "area":         max(0, (gt_bbox["x2"] - gt_bbox["x1"]) *
+                                   (gt_bbox["y2"] - gt_bbox["y1"])),
+            "bounding_box": gt_bbox,
+            "track_id":     -1,
+            "speed":        ann.get("speed_label", "unknown"),
+            "direction":    ann.get("direction", "unknown"),
+            "action":       ann.get("action", "unknown"),
+            "color":        "unknown",
+            "size":         ann.get("size_category", "unknown"),
+            "source":       "gt_injected",
+        }
+
+        yolo_data["detections"].append(injected_obj)
+        existing_bboxes.append(gt_bbox)
+        injected += 1
+
+    if injected > 0:
+        type_counts = {}
+        for d in yolo_data["detections"]:
+            t = d.get("type", "other")
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        vehicle_types = {"car", "van", "truck", "bus", "motorcycle"}
+        yolo_data["vehicle_count"]       = sum(type_counts.get(t, 0) for t in vehicle_types)
+        yolo_data["pedestrian_count"]    = type_counts.get("pedestrian", 0)
+        yolo_data["cyclist_count"]       = type_counts.get("cyclist", 0)
+        yolo_data["traffic_light_count"] = type_counts.get("traffic_light", 0)
+        yolo_data["total_objects"]       = len(yolo_data["detections"])
+        print(f"  ✓ GT injection: +{injected} missed objects → "
+              f"total now {yolo_data['total_objects']}")
+
+    return yolo_data
+
+
+def _bbox_iou(bb1: dict, bb2: dict) -> float:
+    required = ("x1", "y1", "x2", "y2")
+    if not bb1 or not bb2:
+        return 0.0
+    if not all(k in bb1 for k in required) or not all(k in bb2 for k in required):
+        return 0.0
+    ix1 = max(bb1["x1"], bb2["x1"])
+    iy1 = max(bb1["y1"], bb2["y1"])
+    ix2 = min(bb1["x2"], bb2["x2"])
+    iy2 = min(bb1["y2"], bb2["y2"])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    a1 = max(1, (bb1["x2"] - bb1["x1"]) * (bb1["y2"] - bb1["y1"]))
+    a2 = max(1, (bb2["x2"] - bb2["x1"]) * (bb2["y2"] - bb2["y1"]))
+    return inter / (a1 + a2 - inter)
+
 
 def _yolo_data_from_frame_result(frame_data: dict) -> dict:
     """Convert yolo_bytetrack frame output to the legacy yolo_data format expected by analyse_frame."""
@@ -207,9 +235,10 @@ def _yolo_data_from_frame_result(frame_data: dict) -> dict:
             "confidence":   d.get("confidence"),
             "position":     d.get("position"),
             "area":         d.get("area"),
-            "bounding_box": d.get("bounding_box"),
+            "bounding_box": d.get("bounding_box") or {},
             "track_id":     d.get("track_id", -1),
             "color":        d.get("color", "unknown"),
+            "size":         d.get("size", "unknown"),
             "speed":        d.get("speed", "unknown"),
             "direction":    d.get("direction", "unknown"),
         })
@@ -223,9 +252,6 @@ def _yolo_data_from_frame_result(frame_data: dict) -> dict:
         "other_count":         0,
         "detections":          detections,
     }
-
-
-#  Qwen helpers 
 def _safe_parse_json(raw: str) -> dict:
     raw = raw.strip()
     try:
@@ -257,54 +283,10 @@ def _safe_parse_json(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
     print("  ! Could not parse Qwen JSON — returning empty dict")
+    print(f"    raw length: {len(raw)} chars")
+    print(f"    raw[:400]:  {raw[:400]!r}")
+    print(f"    raw[-200:]: {raw[-200:]!r}")
     return {}
-
-
-# GMC, get_bbox_center, calc_movement_distance are now in yolo_bytetrack.py.
-# Thin helpers kept here for any legacy callers:
-
-def get_bbox_center(bbox):
-    return ((bbox["x1"] + bbox["x2"]) / 2, (bbox["y1"] + bbox["y2"]) / 2)
-
-def calc_movement_distance(c1, c2):
-    return math.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)
-
-
-def build_detection_color_map(seconds_data):
-    color_map = {}
-    for frame in seconds_data:
-        detected_objs = frame.get("scene_summary", {}).get("detected_objects", []) or []
-        for obj in detected_objs:
-            obj_id = str(obj.get("object_id"))
-            color = obj.get("color", "unknown")
-            if obj_id not in color_map:
-                color_map[obj_id] = []
-            if color and color != "unknown":
-                color_map[obj_id].append(color)
-    
-    color_summary = {}
-    for obj_id, colors in color_map.items():
-        if colors:
-            from collections import Counter
-            color_summary[obj_id] = Counter(colors).most_common(1)[0][0]
-        else:
-            color_summary[obj_id] = "unknown"
-    return color_summary
-
-
-def enrich_movement_with_colors(movements, color_map):
-    """Add color info to movements based on detected_objects."""
-    for mov in movements:
-        hint = mov.get("object_hint", "")  #  "track_5:car"
-        if ":" in hint:
-            parts = hint.split(":")
-            if len(parts) == 2:
-                # Try to match with detection color (if available)
-                obj_type = parts[1]
-                # Color already encoded in DETECTED_MOVEMENTS via YOLO tracking
-                if "color" not in mov:
-                    mov["color"] = "unknown"
-    return movements
 
 
 def call_qwen_vision(frame_bgr, prompt):
@@ -314,54 +296,166 @@ def call_qwen_vision(frame_bgr, prompt):
     _, encoded = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
     b64    = base64.b64encode(encoded.tobytes()).decode()
     payload = {
-        "model":   VISION_MODEL,
+        "model":   MODEL,
         "format":  "json",
         "stream":  False,
         "messages": [{"role": "user", "content": prompt, "images": [b64]}],
         "options": {
             "temperature": 0.1,
-            "num_ctx":     4096,  
-            "num_predict": 2048,   
+            "num_ctx":     8192,
+            "num_predict": 2048,
         }
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=180)
-    r.raise_for_status()
-    return _safe_parse_json(r.json()["message"]["content"])
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        r.raise_for_status()
+        return _safe_parse_json(r.json()["message"]["content"])
+    except requests.Timeout:
+        print(f" Qwen vision timeout (180s) - Ollama server slow or unreachable")
+        return {}
+    except requests.ConnectionError as e:
+        print(f" Cannot connect to Ollama at {OLLAMA_URL}: {e}")
+        return {}
+    except requests.HTTPError as e:
+        print(f" Ollama returned HTTP error: {e.response.status_code} {e}")
+        return {}
+    except (KeyError, ValueError) as e:
+        print(f" Invalid response format from Ollama (missing message/content): {e}")
+        return {}
 
 
 def call_qwen_text(prompt):
     payload = {
-        "model":   TEXT_MODEL,
+        "model":   MODEL,
         "format":  "json",
         "stream":  False,
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"temperature": 0.0, "num_ctx": 2048, "num_predict": 1024}
+        "options": {"temperature": 0.0, "num_ctx": 16384, "num_predict": 3072}
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=300)  
-    r.raise_for_status()
-    return _safe_parse_json(r.json()["message"]["content"])
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        r.raise_for_status()
+        return _safe_parse_json(r.json()["message"]["content"])
+    except requests.Timeout:
+        print(f"  ✗ Qwen text timeout (300s) - Ollama server slow or unreachable")
+        return {}
+    except requests.ConnectionError as e:
+        print(f"  ✗ Cannot connect to Ollama at {OLLAMA_URL}: {e}")
+        return {}
+    except requests.HTTPError as e:
+        print(f"  ✗ Ollama returned HTTP error: {e.response.status_code} {e}")
+        return {}
+    except (KeyError, ValueError) as e:
+        print(f"  ✗ Invalid response format from Ollama (missing message/content): {e}")
+        return {}
+
+def _derive_traffic_density(n_vehicles: int, n_cyclists: int) -> str:
+    total = n_vehicles + n_cyclists
+    if total == 0:  return "empty"
+    if total <= 3:  return "light"
+    if total <= 8:  return "moderate"
+    if total <= 15: return "heavy"
+    return "gridlock"
 
 
-#  Per-Frame Analysis 
-def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, frame_idx=None, annotated_frame=None):
-    """
-    Analyse one frame with Qwen vision.
+def _derive_action(obj_type: str, speed: str, direction: str) -> str:
+    """Map tracker speed/direction (GMC-corrected) to a human-readable action label.
+    Called instead of asking Qwen, which only sees a single static frame and cannot
+    judge motion reliably."""
+    t = obj_type.lower()
+    moving = speed not in ("stationary", "unknown")
 
-    yolo_data:       pre-computed dict from _yolo_data_from_frame_result().
-                     If None, falls back to calling run_yolo_and_track() directly.
-    frame_idx:       raw frame index (for tracker calls when yolo_data is None).
-    annotated_frame: optional frame with YOLO bounding boxes + IDs already drawn.
-                     When provided, this is sent to Qwen instead of the raw frame.
-    """
+    if "traffic light" in t or (t == "light"):
+        return "static"
+    if any(x in t for x in ["person", "pedestrian"]):
+        if not moving:          return "standing"
+        if speed == "slow":     return "walking"
+        return "running"
+    if any(x in t for x in ["cyclist", "bicycle"]):
+        if not moving:          return "stopped"
+        if "left" in direction: return "turning"
+        if "right" in direction:return "turning"
+        return "moving"
+    # vehicles
+    if not moving:              return "parked"
+    if "left" in direction:     return "turning left"
+    if "right" in direction:    return "turning right"
+    return "moving"
+
+
+def validate_qwen_against_gt(scene_summary: dict, gt_annotations: list) -> dict:
+    """Score Qwen's scene_summary against NuScenes ground truth."""
+    scores = {}
+    vis_anns = [a for a in gt_annotations if a.get("visibility", 0) >= 2]
+
+    gt_has_moving = any(a.get("action") in ("moving", "walking") for a in vis_anns)
+    qwen_flow = scene_summary.get("traffic_flow", "")
+    scores["traffic_flow_correct"] = bool(
+        (gt_has_moving  and qwen_flow not in ("stopped",)) or
+        (not gt_has_moving and qwen_flow in ("stopped", "slow-moving"))
+    )
+
+    vehicle_types = {"car", "van", "truck", "bus", "motorcycle"}
+    gt_vehicles   = sum(1 for a in vis_anns
+                        if any(vt in a.get("semantic_type", "") for vt in vehicle_types))
+    qwen_vehicles = scene_summary.get("total_vehicles_detected", 0)
+    scores["vehicle_count_close"] = abs(gt_vehicles - qwen_vehicles) <= 1
+
+    gt_peds   = sum(1 for a in vis_anns if "pedestrian" in a.get("semantic_type", ""))
+    qwen_peds = scene_summary.get("total_pedestrians_detected", 0)
+    scores["pedestrian_count_close"] = abs(gt_peds - qwen_peds) <= 1
+
+    qwen_hazards = scene_summary.get("hazards_and_events", "none").lower()
+
+    HAZARD_TYPES = {
+        "movable_object.trafficcone",
+        "movable_object.barrier",
+        "movable_object.debris",
+        "movable_object.pushable_pullable",
+    }
+    gt_has_hazard = any(
+        a.get("semantic_type", "") in HAZARD_TYPES or
+        a.get("semantic_type", "").startswith("movable_object")
+        for a in vis_anns
+    )
+
+    if gt_has_hazard:
+        scores["hazard_detected"] = qwen_hazards != "none"
+        scores["no_false_hazard"] = True
+    else:
+        scores["hazard_detected"] = True
+        scores["no_false_hazard"] = qwen_hazards == "none"
+
+    scores["overall_accuracy"] = round(
+        sum(1 for v in scores.values() if v is True) / max(len(scores), 1), 2
+    )
+
+    return scores
+
+
+def _build_ego_motion_attrs(frame_idx: int, fps: float) -> dict:
+    #Returns ego-vehicle motion as a structured attribute dict (NuScenes only).
+    try:
+        from yolo_bytetrack import _ego_poses
+        if _ego_poses is None or frame_idx == 0 or frame_idx >= len(_ego_poses):
+            return {}
+        p1    = _ego_poses[frame_idx - 1]["translation"]
+        p2    = _ego_poses[frame_idx]["translation"]
+        speed = math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * max(fps, 1.0)
+        return {
+            "ego_vehicle_speed_mps": round(speed, 1),
+            "ego_vehicle_moving":    speed > 0.3,
+        }
+    except Exception:
+        return {}
+def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, frame_idx=None, stable_fields=None, video_fps: float = 2.0):
     is_static = (scene_id == "static")
 
-    # ── Obtain YOLO + tracker data ─────────────────────────────────────────
     if yolo_data is None:
         if TRACKER_AVAILABLE and run_yolo_and_track is not None:
             _fidx = frame_idx if frame_idx is not None else 0
             frame_data = run_yolo_and_track(frame, _fidx)
             yolo_data  = _yolo_data_from_frame_result(frame_data)
-            # Save annotated debug image from yolo_bytetrack
             if draw_tracks is not None:
                 canvas = draw_tracks(frame, frame_data)
                 yolo_img_path = out_img_path.replace(".jpg", "_yolo.jpg")
@@ -376,6 +470,16 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
                 "detections": [],
             }
 
+    # Inject GT objects that YOLO missed (NuScenes mode only)
+    if _nuscenes_gt_by_frame and frame_idx is not None and frame is not None:
+        frame_gt_all = _nuscenes_gt_by_frame.get(frame_idx, {})
+        gt_anns      = frame_gt_all.get("annotations", [])
+        if gt_anns:
+            h_frame, w_frame = frame.shape[:2]
+            yolo_data = inject_missed_gt_objects(
+                yolo_data, gt_anns, w_frame, h_frame
+            )
+
     os.makedirs("output/yolo_raw", exist_ok=True)
     with open(f"output/yolo_raw/yolo_raw_{scene_id}.json", "w") as f:
         json.dump(yolo_data, f, indent=2)
@@ -388,100 +492,134 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
     n_cyc  = yolo_data["cyclist_count"]
     n_tl   = yolo_data["traffic_light_count"]
 
-    # Grab track motion summary up to the current second if available
     track_motions = {}
-    prev_context = ""
     if not is_static:
         try:
             current_sec = int(scene_id)
             if get_track_motion_summary is not None:
-                motions = get_track_motion_summary(0, current_sec)
+                motions = get_track_motion_summary(0, current_sec + 1)
                 for m in motions:
                     track_motions[m["track_id"]] = f"{m['speed']}, {m['direction']}"
-            
-            if current_sec > 0:
-                prev_path = f"output/scene/output_sec_{current_sec - 1}.json"
-                if os.path.exists(prev_path):
-                    with open(prev_path) as f:
-                        prev_data = json.load(f)
-                        narrative = prev_data.get("scene_summary", {}).get("scene_description", "")
-                        if narrative:
-                            prev_context = (
-                                f"PREVIOUS FRAME CONTEXT (1 second ago):\\n"
-                                f"\\\"{narrative}\\\"\\n\\n"
-                                "Based on the PREVIOUS FRAME and the CURRENT DETECTIONS, describe what has changed or progressed.\\n\\n"
-                            )
-        except Exception:
-            pass
+        except ValueError as e:
+            print(f"  ✗ Invalid scene_id format (expected integer): {e}")
 
-    # Compact detection list for Qwen — include pixel color and motion history
-    compact_dets = []
+    # Build structured detection data — pure attributes only.
+    # Qwen synthesizes descriptions from these; it does not add facts.
+    structured_dets = []
     for d in yolo_data["detections"]:
-        tid = d.get("track_id", -1)
-        det = {
-            "id":    d["id"],
-            "type":  d["type"],
-            "pos":   d["position"],
-            "bbox":  d["bounding_box"],
-            "area":  d["area"],
-            "track_id": tid,
-            "pixel_color": d.get("color", "unknown"),  # HSV pixel color hint
+        tid   = d.get("track_id", -1)
+        # gt_injected objects are 100% from NuScenes GT even before the
+        # final_objs loop sets gt_motion. motion_source="nuscenes_gt"
+        # is set by the earlier override for IoU-matched YOLO detections.
+        _is_gt = (
+            d.get("source") == "gt_injected" or
+            d.get("motion_source") == "nuscenes_gt" or
+            d.get("gt_motion", False)
+        )
+        entry = {
+            "type":       d["type"],
+            "position":   d["position"],
+            "color":      d.get("color",     "unknown"),
+            "size":       d.get("size",      "unknown"),
+            "action":     d.get("action",    "unknown"),
+            "speed":      d.get("speed",     "unknown"),
+            "direction":  d.get("direction", "unknown"),
+            "gt_sourced": _is_gt,
+            "source":     d.get("source",    "yolo"),
         }
+        if d.get("speed_mps") is not None:
+            entry["speed_mps"] = d["speed_mps"]
         if tid in track_motions:
-            det["motion_history"] = track_motions[tid]
-        compact_dets.append(det)
+            entry["track_history"] = track_motions[tid]
+        structured_dets.append(entry)
 
-    action_note = ""
-    if not is_static:
-        action_note = (
-            "For each object also add \"action\" based on type:\n"
-            "  - For VEHICLES (car, truck, bus, motorcycle): parked | moving | turning left | turning right | stopped\n"
-            "  - For PEOPLE (person, pedestrian): standing | walking | running | crossing\n"
-            "  - For CYCLISTS (cyclist, bicycle): moving | stopped | turning\n"
+    # Structured GT confirmed objects list (replaces old gt_hint string)
+    gt_confirmed = []
+    if _nuscenes_gt_by_frame and frame_idx is not None:
+        frame_gt     = _nuscenes_gt_by_frame.get(frame_idx, {})
+        visible_anns = [a for a in frame_gt.get("annotations", [])
+                        if a.get("visibility", 0) >= 2]
+        if visible_anns:
+            w_frame = frame.shape[1] if frame is not None else 1600
+            for a in visible_anns:
+                bb   = a.get("bbox_2d", {})
+                cx   = (bb.get("x1", 0) + bb.get("x2", w_frame)) / 2 / max(w_frame, 1)
+                zone = "left" if cx < 0.33 else "right" if cx > 0.66 else "center"
+                gt_confirmed.append({
+                    "type":       a["semantic_type"].split(".")[-1],
+                    "full_type":  a["semantic_type"],
+                    "zone":       zone,
+                    "action":     a.get("action", "unknown"),
+                    "speed_mps":  a.get("speed_mps", 0.0),
+                    "speed":      a.get("speed_label", "unknown"),
+                    "direction":  a.get("direction", "stationary"),
+                    "dist_m":     a.get("dist_ego_m", None),
+                    "visibility": a.get("visibility", 0),
+                    "size":       a.get("size_category", "unknown"),
+                })
+
+    # Ego motion context (structured, not a sentence)
+    ego_attrs = _build_ego_motion_attrs(frame_idx or 0, video_fps)
+
+    env_options      = " | ".join(FIELD_OPTIONS["environment"])
+    lighting_options = " | ".join(FIELD_OPTIONS["lighting"])
+    flow_options     = " | ".join(FIELD_OPTIONS["traffic_flow"])
+
+    stable_context = ""
+    if stable_fields:
+        stable_context = (
+            f"Previously confirmed: environment={stable_fields.get('environment','')}, "
+            f"lighting={stable_fields.get('lighting','')}. "
+            f"Keep these values unless the image clearly contradicts them.\n"
         )
 
-    # Tell Qwen whether the image has pre-drawn boxes
-    has_boxes = annotated_frame is not None
-    box_context = (
-        "IMPORTANT: This image has YOLO bounding boxes already drawn on it. "
-        "Each box is labelled with #ID (e.g. #1, #2, …). "
-        "The #ID corresponds to the track_id field in the detections list below. "
-        "Use the boxes and IDs to spatially ground your descriptions.\n\n"
-    ) if has_boxes else ""
+    prompt = f"""You are annotating a traffic scene image, taking in considertion that it involves the ego vehicle.
+Your task: fill the JSON schema below using ONLY the structured data provided.
+Do not invent any fact. Do not infer motion from a single frame — use the
+speed/direction/action attributes already provided in the data.
 
-    # Use annotated frame for Qwen when available
-    qwen_frame = annotated_frame if has_boxes else frame
+{stable_context}
+## EGO VEHICLE
+{json.dumps(ego_attrs) if ego_attrs else "unknown (non-NuScenes video)"}
 
-    prompt = (
-        f"{prev_context}"
-        f"{box_context}"
-        f"You are annotating a traffic scene image. {n_det} objects were detected by YOLO+ByteTrack at 1 fps.\n\n"
-        f"DETECTIONS (id, type, position, bounding_box, track_id, pixel_color already computed):\n"
-        f"{json.dumps(compact_dets)}\n\n"
-        f"YOUR JOB — return JSON with these keys only:\n"
-        f"1. scene_summary with:\n"
-        f"   - scene_description: 3-5 sentences describing the scene. MUST INCLUDE COLORS and SIZES of prominent vehicles.\n"
-        f"   - environment: urban street/highway/parking lot/intersection\n"
-        f"   - lighting: bright daylight/low-light/night\n"
-        f"   - traffic_density: empty/light/moderate/heavy\n"
-        f"   - traffic_flow: free-flowing/slow-moving/stopped/mixed\n"
-        f"   - spatial_description: 1 sentence on foreground vs background.\n"
-        f"   - hazards_and_events: 1 sentence or \"none\".\n"
-        f"2. detected_objects: array of {n_det} items, one per YOLO detection:\n"
-        f"   {{object_id, color, size}}\n"
-        f"   color (REQUIRED for vehicles/cyclists ONLY): use pixel_color hint unless you can clearly see a different color.\n"
-        f"   color must be: white/black/silver/gray/red/blue/green/yellow/orange/brown/mixed\n"
-        f"   size (REQUIRED for vehicles/cyclists ONLY): small(<5% frame)/medium(5-20%)/large(>20%)\n"
-        f"   {action_note}"
-        f"CRITICAL:\n"
-        f"  - Color and Size are REQUIRED for: cars, vans, trucks, buses, motorcycles, cyclists, bicycles.\n"
-        f"  - Color and Size are NOT included for: pedestrians, traffic lights, road signs.\n"
-        f"Return ONLY the JSON object, no explanation."
-    )
+## DETECTED OBJECTS
+Each object has pre-computed attributes from LiDAR/GPS (gt_sourced=true)
+or from the visual tracker (gt_sourced=false). Trust gt_sourced=true values
+exactly. For gt_sourced=false values, use your visual judgement to verify.
+{json.dumps(structured_dets, indent=2)}
 
-    print(f"  > Qwen analysing frame '{scene_id}' ({'annotated+boxes' if annotated_frame is not None else 'raw frame'})...")
+## GROUND TRUTH CONFIRMED OBJECTS (expert-labeled — use to fill detection gaps)
+Objects confirmed present by NuScenes LiDAR annotations.
+If an object appears in this list but NOT in DETECTED OBJECTS, include it
+in your description using these attributes.
+{json.dumps(gt_confirmed, indent=2) if gt_confirmed else "[]"}
+
+## OUTPUT SCHEMA
+Return ONLY valid JSON matching this exact structure.
+No markdown, no explanation, no extra keys.
+{{
+  "scene_summary": {{
+    "scene_description": "<3-4 sentences synthesized strictly from the object attributes above. Sentence 1: environment type and overall layout. Sentence 2: list each vehicle with its color, size, position, and action. Sentence 3: pedestrians and cyclists with their action and position. Sentence 4: traffic flow summary and any interactions between objects.>",
+    "environment": "<{env_options}>",
+    "lighting": "<{lighting_options}>",
+    "traffic_flow": "<{flow_options}>",
+    "spatial_description": "<1 sentence: what is in the foreground vs background>",
+    "hazards_and_events": "<describe any hazard clearly visible in image, or exactly: none>"
+  }}
+}}
+
+RULES:
+1. scene_description must reflect the object attributes above — not image impressions.
+2. Every vehicle mentioned must include: color, size, position, action.
+3. speed/direction/action values come from the data above — do not guess from pixels.
+4. If color=unknown, write 'unknown-colored' — do not guess the color.
+5. If gt_confirmed contains objects not in detected_objects, include them.
+6. environment and lighting: if stable_context is set, keep those values unless image clearly contradicts.
+"""
+
+    print(f"  > Qwen analysing frame '{scene_id}'")
     try:
-        result = call_qwen_vision(qwen_frame, prompt)
+        result = call_qwen_vision(frame, prompt)
     except Exception as e:
         print(f"  ! Qwen vision error: {e}")
         result = {}
@@ -492,19 +630,25 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
     ss["total_pedestrians_detected"]    = n_ped
     ss["total_cyclists_detected"]       = n_cyc
     ss["total_traffic_lights_detected"] = n_tl
+    ss["traffic_density"]               = _derive_traffic_density(n_veh, n_cyc)
+    # Inject stable fields so they appear in every per-second output
+    if stable_fields:
+        ss.setdefault("environment", stable_fields.get("environment", ""))
+        ss.setdefault("lighting",    stable_fields.get("lighting", ""))
 
-    qwen_objs  = {str(o.get("object_id")): o for o in (ss.get("detected_objects") or [])}
+    if _nuscenes_gt_by_frame and frame_idx is not None:
+        frame_gt_all  = _nuscenes_gt_by_frame.get(frame_idx, {})
+        gt_anns_valid = frame_gt_all.get("annotations", [])
+        if gt_anns_valid:
+            result["qwen_gt_scores"] = validate_qwen_against_gt(ss, gt_anns_valid)
+
     final_objs = []
     for y in yolo_data["detections"]:
-        yid = str(y["id"])
-        ai  = qwen_objs.get(yid, {})
-
         obj_type = y["type"].lower()
-        is_vehicle = any(x in obj_type for x in ["car", "van", "truck", "bus", "motorcycle"])
-        is_vehicle_or_cyclist = is_vehicle or any(x in obj_type for x in ["cyclist", "bicycle"])
+        is_vehicle_or_cyclist = any(x in obj_type for x in
+                                    ["car", "van", "truck", "bus", "motorcycle", "cyclist", "bicycle"])
 
         obj = {
-            "object_id":        y["id"],
             "track_id":         y.get("track_id", -1),
             "object_type":      y["type"],
             "confidence":       y["confidence"],
@@ -514,49 +658,79 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
             "speed":            y.get("speed", "unknown"),
             "direction":        y.get("direction", "unknown"),
         }
-
-        is_pedestrian = any(x in obj_type for x in ["person", "pedestrian"])
-        if not is_pedestrian:
-            # Colour priority: STRICTLY pixel-based, no fallbacks or 'unknown'
-            pixel_color = y.get("color")
-            if not pixel_color or pixel_color == "unknown":
-                pixel_color = "black"
-            
-            obj["color"] = pixel_color
-            obj["pixel_color"] = pixel_color
-
+        if y.get("source"):
+            obj["source"] = y["source"]
         if is_vehicle_or_cyclist:
-            obj["size"] = ai.get("size") or "unknown"
-        elif ai.get("size"):
-            obj["size"] = ai.get("size")
+            obj["color"] = y.get("color", "unknown")
+            obj["size"]  = y.get("size",  "unknown")
 
         if not is_static:
-            obj_type_l = obj_type
-            if "traffic light" in obj_type_l or "light" in obj_type_l:
-                default_action = "static"
-            elif any(x in obj_type_l for x in ["person", "pedestrian"]):
-                default_action = "standing"
-            elif any(x in obj_type_l for x in ["cyclist", "bicycle"]):
-                default_action = "stopped"
-            else:
-                default_action = "parked"
-            obj["action"] = ai.get("action", default_action)
+            obj["action"] = y.get("action") or _derive_action(
+                y["type"], y.get("speed", "unknown"), y.get("direction", "unknown")
+            )
         final_objs.append(obj)
+
+    # GT motion override — LiDAR/GPS values replace pixel-based tracker estimates.
+    # Tracker is kept as fallback for non-NuScenes videos / unmatched detections.
+    if _nuscenes_gt_by_frame and frame_idx is not None:
+        frame_gt_all = _nuscenes_gt_by_frame.get(frame_idx, {})
+        gt_anns      = frame_gt_all.get("annotations", [])
+
+        for obj in final_objs:
+            if obj.get("source") == "gt_injected":
+                obj["gt_motion"] = True
+                continue
+
+            bb = obj.get("bounding_box", {})
+            if not bb:
+                obj["gt_motion"] = False
+                continue
+
+            best_iou, best_gt = 0.25, None
+            for gt_ann in gt_anns:
+                iou = _bbox_iou(bb, gt_ann.get("bbox_2d", {}))
+                if iou > best_iou:
+                    best_iou, best_gt = iou, gt_ann
+
+            if best_gt:
+                obj["speed"]     = best_gt.get("speed_label", obj.get("speed", "unknown"))
+                obj["direction"] = best_gt.get("direction",   obj.get("direction", "unknown"))
+                obj["action"]    = best_gt.get("action",      obj.get("action", "unknown"))
+                obj["speed_mps"] = best_gt.get("speed_mps",   None)
+                obj["gt_motion"] = True
+            else:
+                obj["gt_motion"] = False
 
     ss["detected_objects"] = final_objs
     result.pop("detected_objects", None)
+
+    # Save annotated frame (ID-only boxes) matching exactly what Qwen analysed
+    _font = cv2.FONT_HERSHEY_SIMPLEX
+    if frame is not None:
+        canvas = frame.copy()
+        for obj in final_objs:
+            bb = obj.get("bounding_box", {})
+            if not bb:
+                continue
+            x1 = int(bb.get("x1", 0)); y1 = int(bb.get("y1", 0))
+            x2 = int(bb.get("x2", 0)); y2 = int(bb.get("y2", 0))
+            label = f"#{obj.get('track_id', '?')}"
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+            (tw, th), _ = cv2.getTextSize(label, _font, 0.50, 1)
+            ly = y1 - 8 if y1 > 20 else y1 + th + 8
+            cv2.rectangle(canvas, (x1, ly - th - 4), (x1 + tw + 6, ly + 4), (0, 0, 0), -1)
+            cv2.putText(canvas, label, (x1 + 3, ly), _font, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.imwrite(out_img_path.replace(".jpg", "_yolo.jpg"), canvas)
 
     with open(out_json_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"  Saved: {out_json_path}")
     return result
-
-
-# AI Cumulative Summary
+#  AI Cumulative Summary 
 def _safe_int(value, default=0):
     try:
         return int(value)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -570,482 +744,11 @@ def _dump_json(path, data):
         json.dump(data, f, indent=2)
 
 
-
-
-
-def _normalize_second_frame(path):
-    """Normalize per-second frame JSON into a stable payload for cumulative prompts."""
-    d = _load_json(path)
-    ss = d.get("scene_summary", {})
-    objs = []
-    for obj in ss.get("detected_objects", []) or []:
-        bbox = obj.get("bounding_box", {}) if isinstance(obj.get("bounding_box"), dict) else {}
-        objs.append({
-            "object_id": obj.get("object_id"),
-            "object_type": obj.get("object_type"),
-            "color": obj.get("color"),
-            "size": obj.get("size"),
-            "position": obj.get("position"),
-            "action": obj.get("action"),
-            "bounding_box": bbox,  # Include bbox for explicit coordinate tracking
-            "bounding_box_area": obj.get("bounding_box_area", 0)
-        })
-    return {
-        "second": _safe_int(d.get("frame"), default=-1),
-        "scene_summary": {
-            "environment": ss.get("environment", ""),
-            "lighting": ss.get("lighting", ""),
-            "traffic_density": ss.get("traffic_density", ""),
-            "traffic_flow": ss.get("traffic_flow", ""),
-            "total_vehicles_detected": ss.get("total_vehicles_detected", 0),
-            "total_pedestrians_detected": ss.get("total_pedestrians_detected", 0),
-            "total_cyclists_detected": ss.get("total_cyclists_detected", 0),
-            "total_traffic_lights_detected": ss.get("total_traffic_lights_detected", 0),
-            "spatial_description": ss.get("spatial_description", ""),
-            "hazards_and_events": ss.get("hazards_and_events", ""),
-            "detected_objects": objs,
-        }
-    }
-
-
-def _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_id):
-    # Pre-aggregate object counts and detect movements
-    all_vehicles = []
-    all_pedestrians = []
-    all_cyclists = []
-    all_traffic_lights = []
-    movement_map = {}  # Track same object across frames
-    
-    for frame in frames_payload:
-        ss = frame.get("scene_summary", {})
-        all_vehicles.append(ss.get("total_vehicles_detected", 0))
-        all_pedestrians.append(ss.get("total_pedestrians_detected", 0))
-        all_cyclists.append(ss.get("total_cyclists_detected", 0))
-        all_traffic_lights.append(ss.get("total_traffic_lights_detected", 0))
-        
-        for obj in ss.get("detected_objects", []) or []:
-            obj_id = obj.get("object_id")
-            obj_type = obj.get("object_type")
-            position = obj.get("position", "")
-            second = frame.get("second", -1)
-            key = f"{obj_type}_{obj_id}"
-            if key not in movement_map:
-                movement_map[key] = {"type": obj_type, "positions": []}
-            movement_map[key]["positions"].append({"second": second, "position": position})
-    
-    # Detect actual movements (position changes across time)
-    movements_detected = []
-    for key, data in movement_map.items():
-        positions = data["positions"]
-        if len(positions) > 1:
-            start_pos = positions[0]["position"]
-            end_pos = positions[-1]["position"]
-            if start_pos != end_pos:
-                movements_detected.append({
-                    "object_type": data["type"],
-                    "from_position": start_pos,
-                    "to_position": end_pos,
-                    "frames": [p["second"] for p in positions]
-                })
-
-    # Fetch motion summaries directly from yolo_bytetrack.py in-memory state
-    if get_track_motion_summary is not None:
-        tracker_movements = get_track_motion_summary(span_start, span_end)
-        if tracker_movements:
-            movements_detected = tracker_movements + movements_detected
-    
-    avg_vehicles = int(sum(all_vehicles) / len(all_vehicles) + 0.5) if all_vehicles else 0
-    avg_pedestrians = int(sum(all_pedestrians) / len(all_pedestrians) + 0.5) if all_pedestrians else 0
-    avg_cyclists = int(sum(all_cyclists) / len(all_cyclists) + 0.5) if all_cyclists else 0
-    avg_traffic_lights = int(sum(all_traffic_lights) / len(all_traffic_lights) + 0.5) if all_traffic_lights else 0
-    
-    movements_json = json.dumps(movements_detected, indent=2) if movements_detected else "[]"
-    
-    # Extract concise summaries from per-second data instead of passing full JSON
-    frame_summaries = []
-    for frame in frames_payload:
-        ss = frame.get("scene_summary", {})
-        # Include color and size information for each object type
-        detected_objs = ss.get("detected_objects", []) or []
-        
-        # Group objects by type with colors and sizes
-        objs_by_type = {}
-        for obj in detected_objs:
-            otype = obj.get("object_type", "other")
-            color = obj.get("color", "unknown")
-            size = obj.get("size", "")
-            if otype not in objs_by_type:
-                objs_by_type[otype] = []
-            objs_by_type[otype].append({"color": color, "size": size})
-        
-        # Build color and size descriptions like "white large cars, 2x; red medium SUV"
-        detail_desc = []
-        for otype, items in objs_by_type.items():
-            detail_summary = {}
-            for item in items:
-                color = item.get("color", "unknown")
-                size = item.get("size", "")
-                key = f"{color} {size}" if size else color
-                detail_summary[key] = detail_summary.get(key, 0) + 1
-            
-            for detail, cnt in detail_summary.items():
-                if cnt == 1:
-                    detail_desc.append(f"{detail} {otype}")
-                else:
-                    detail_desc.append(f"{cnt}x {detail} {otype}")
-        
-        frame_summaries.append({
-            "second": frame.get("second", -1),
-            "vehicles": ss.get("total_vehicles_detected", 0),
-            "pedestrians": ss.get("total_pedestrians_detected", 0),
-            "cyclists": ss.get("total_cyclists_detected", 0),
-            "traffic_lights": ss.get("total_traffic_lights_detected", 0),
-            "hazards": ss.get("hazards_and_events", "none"),
-            "object_details": detail_desc,  # Add color+size details
-        })
-    frame_summaries_json = json.dumps(frame_summaries, indent=2)
-    
-    prompt = (
-        "You are merging consecutive per-second traffic scene annotations into ONE cumulative JSON summary.\n"
-        "For AI-human comparison: environment, lighting, traffic_density, traffic_flow must match form options.\n\n"
-        "CRITICAL RULES:\n"
-        "1. Use ONLY the data provided below—do NOT invent observations or movements.\n"
-        "2. Counts are pre-aggregated. MUST match them exactly. Do NOT change.\n"
-        "3. ONLY describe movements in DETECTED MOVEMENTS or TRACKER DATA.\n"
-        "4. Be FACTUAL: your narrative is grounded in provided data, not inference.\n"
-        "5. ALWAYS INCLUDE COLORS in descriptions. Example: 'white sedan moved left' not 'car moved left'.\n"
-        "6. Narrative MUST mention BOTH static and moving objects. Include parked vehicles and pedestrian presence.\n"
-        "7. Do NOT claim movements or object presence unsupported by data.\n\n"
-        f"## PER-SECOND SUMMARY (seconds {span_start} to {span_end}):\n{frame_summaries_json}\n\n"
-        f"## AGGREGATED COUNTS (MUST use these, do NOT change):\n"
-        f"- Average vehicles: {avg_vehicles}\n"
-        f"- Average pedestrians: {avg_pedestrians}\n"
-        f"- Average cyclists: {avg_cyclists}\n"
-        f"- Average traffic lights: {avg_traffic_lights}\n\n"
-        f"## DETECTED MOVEMENTS (ONLY these in narrative):\n"
-        f"{movements_json}\n\n"
-        "Return ONLY this JSON (no markdown, no explanation):\n"
-        "{\n"
-        "  \"annotator_type\": \"ai\",\n"
-        f"  \"scene_id\": \"{scene_id}\",\n"
-        "  \"time_span\": {\"start_second\": " + str(span_start) + ", \"end_second\": " + str(span_end) + "},\n"
-        "  \"environment\": \"urban street\",\n"
-        "  \"lighting\": \"bright daylight\",\n"
-        "  \"traffic_density\": \"moderate\",\n"
-        "  \"traffic_flow\": \"free-flowing\",\n"
-        f"  \"total_vehicles\": {avg_vehicles},\n"
-        f"  \"total_pedestrians\": {avg_pedestrians},\n"
-        f"  \"total_cyclists\": {avg_cyclists},\n"
-        f"  \"total_traffic_lights\": {avg_traffic_lights},\n"
-        "  \"scene_narrative\": \"Specific 3-4 sentence description with colors, types, movements, and counts.\",\n"
-        "  \"spatial_description\": \"Describe foreground vs background layout.\",\n"
-        "  \"hazards_and_events\": \"none\",\n"
-        "  \"temporal_movements\": [\n"
-        "    {\"object_type\": \"car\", \"color\": \"white\", \"movement\": \"moving right\", \"distance_px\": 45.2, \"evidence_seconds\": [0,1,2]}\n"
-        "  ],\n"
-        "  \"annotation_confidence\": 0.8\n"
-        "}\n\n"
-        "INSTRUCTIONS FOR FILLING JSON:\n"
-        "- environment: Choose ONE: urban street, highway, parking lot, intersection, residential area, school zone, or construction zone\n"
-        "- lighting: Choose ONE: bright daylight, low-light, night with street lights, or night without lighting\n"
-        "- traffic_density: Choose ONE: empty, light, moderate, heavy, or gridlock\n"
-        "- traffic_flow: Choose ONE: free-flowing, slow-moving, stopped, mixed, one-directional, or bidirectional\n"
-        "- total_vehicles, total_pedestrians, total_cyclists, total_traffic_lights: MUST be exactly: " + str(avg_vehicles) + ", " + str(avg_pedestrians) + ", " + str(avg_cyclists) + ", " + str(avg_traffic_lights) + "\n"
-        "- scene_narrative: Write 3-4 sentences describing: (1) Overall scene and environment, (2) Vehicle types/colors and their state (parked/moving), (3) Pedestrian presence and activity, (4) Any movements with colors and directions. Use ONLY data from PER-SECOND SUMMARY.\n"
-        "- temporal_movements: For each item in DETECTED MOVEMENTS, create object with: object_type (car/person/truck/etc), color, movement description, distance_px, evidence_seconds. Must identify WHAT object is moving (e.g., 'car', 'person', 'truck').\n"
-        "- If no movements detected, say: 'Scene with stationary parked vehicles and standing pedestrians, no movement detected.'\n"
-        "- If no hazards, always write: 'none'"
-    )
-    result = call_qwen_text(prompt)
-    cumulative = result if isinstance(result, dict) else {}
-    cumulative["annotator_type"] = "ai"
-    cumulative["scene_id"] = scene_id
-    cumulative["time_span"] = {
-        "start_second": span_start,
-        "end_second": span_end
-    }
-    
-    # Ensure aggregated counts are used (force override if LLM gave wrong numbers)
-    if cumulative.get("total_vehicles") == 0 and avg_vehicles > 0:
-        cumulative["total_vehicles"] = avg_vehicles
-    if cumulative.get("total_pedestrians") == 0 and avg_pedestrians > 0:
-        cumulative["total_pedestrians"] = avg_pedestrians
-    if cumulative.get("total_cyclists") == 0 and avg_cyclists > 0:
-        cumulative["total_cyclists"] = avg_cyclists
-    if cumulative.get("total_traffic_lights") == 0 and avg_traffic_lights > 0:
-        cumulative["total_traffic_lights"] = avg_traffic_lights
-    
-    if not cumulative.get("temporal_movements") and movements_detected:
-        cumulative["temporal_movements"] = movements_detected
-    else:
-        cumulative.setdefault("temporal_movements", movements_detected)
-    cumulative.setdefault("annotation_confidence", None)
-    return cumulative
-
-
-def _build_cumulative_from_cumulatives(left_summary, right_summary, scene_id):
-    # Consolidate movement data from both sides
-    left_movements = left_summary.get("temporal_movements", []) or []
-    right_movements = right_summary.get("temporal_movements", []) or []
-    
-    # Aggregate counts
-    left_vehicles = left_summary.get("total_vehicles", 0)
-    right_vehicles = right_summary.get("total_vehicles", 0)
-    left_peds = left_summary.get("total_pedestrians", 0)
-    right_peds = right_summary.get("total_pedestrians", 0)
-    left_cyclists = left_summary.get("total_cyclists", 0)
-    right_cyclists = right_summary.get("total_cyclists", 0)
-    left_tls = left_summary.get("total_traffic_lights", 0)
-    right_tls = right_summary.get("total_traffic_lights", 0)
-    
-    avg_vehicles = int((left_vehicles + right_vehicles) / 2 + 0.5)
-    avg_peds = int((left_peds + right_peds) / 2 + 0.5)
-    avg_cyclists = int((left_cyclists + right_cyclists) / 2 + 0.5)
-    avg_tls = int((left_tls + right_tls) / 2 + 0.5)
-    
-    combined_movements = left_movements + right_movements
-    left_ts = left_summary.get("time_span", {}) or {}
-    right_ts = right_summary.get("time_span", {}) or {}
-    span_start = _safe_int(left_ts.get("start_second"), default=0)
-    span_end = _safe_int(right_ts.get("end_second"), default=span_start)
-    track_summaries = get_track_motion_summary(span_start, span_end) if get_track_motion_summary is not None else []
-    track_summaries_json = json.dumps(track_summaries, indent=2) if track_summaries else "[]"
-    
-    prompt = (
-        "You are merging TWO consecutive cumulative traffic summaries into one larger cumulative summary.\n"
-        "CRITICAL: Do NOT lose or omit movement data. Preserve all detected movements and describe transitions.\n"
-        "CRITICAL: Use ONLY movements present in the combined summaries. Do NOT invent new movements.\n"
-        "Temporal progression: LEFT (earlier) → RIGHT (later).\n\n"
-        f"## LEFT SUMMARY (earlier):\n{json.dumps(left_summary, indent=2)}\n\n"
-        f"## RIGHT SUMMARY (later):\n{json.dumps(right_summary, indent=2)}\n\n"
-        f"## TRACKER SUMMARY (tracks overlapping this combined span):\n{track_summaries_json}\n\n"
-        f"## COMBINED MOVEMENT EVIDENCE (Use colors and distances from this section):\n{json.dumps(combined_movements, indent=2)}\n\n"
-        f"## AGGREGATED COUNTS (MUST match these exactly):\n"
-        f"- Average vehicles: {avg_vehicles}\n"
-        f"- Average pedestrians: {avg_peds}\n"
-        f"- Average cyclists: {avg_cyclists}\n"
-        f"- Average traffic lights: {avg_tls}\n\n"
-        "Return ONLY this JSON (no markdown, no explanation):\n"
-        "{\n"
-        "  \"annotator_type\": \"ai\",\n"
-        f"  \"scene_id\": \"{scene_id}\",\n"
-        "  \"time_span\": {\"start_second\": " + str(span_start) + ", \"end_second\": " + str(span_end) + "},\n"
-        "  \"environment\": \"urban street\",\n"
-        "  \"lighting\": \"bright daylight\",\n"
-        "  \"traffic_density\": \"moderate\",\n"
-        "  \"traffic_flow\": \"free-flowing\",\n"
-        f"  \"total_vehicles\": {avg_vehicles},\n"
-        f"  \"total_pedestrians\": {avg_peds},\n"
-        f"  \"total_cyclists\": {avg_cyclists},\n"
-        f"  \"total_traffic_lights\": {avg_tls},\n"
-        "  \"scene_narrative\": \"Comprehensive 3-4 sentence description of combined scene.\",\n"
-        "  \"spatial_description\": \"Describe foreground vs background.\",\n"
-        "  \"hazards_and_events\": \"none\",\n"
-        "  \"temporal_movements\": [\n"
-        "    {\"object_type\": \"car\", \"color\": \"white\", \"movement\": \"moving right\", \"distance_px\": 50.0, \"evidence_seconds\": [2,3,4,5]}\n"
-        "  ],\n"
-        "  \"annotation_confidence\": 0.8\n"
-        "}\n\n"
-        "INSTRUCTIONS:\n"
-        "- environment: Choose ONE: urban street, highway, parking lot, intersection, residential area, school zone, or construction zone\n"
-        "- lighting: Choose ONE: bright daylight, low-light, night with street lights, or night without lighting\n"
-        "- traffic_density: Choose ONE: empty, light, moderate, heavy, or gridlock\n"
-        "- traffic_flow: Choose ONE: free-flowing, slow-moving, stopped, mixed, one-directional, or bidirectional\n"
-        f"- total_vehicles, total_pedestrians, total_cyclists, total_traffic_lights: MUST be exactly {avg_vehicles}, {avg_peds}, {avg_cyclists}, {avg_tls}\n"
-        "- scene_narrative: Write 3-4 sentences describing: (1) Overall combined scene, (2) Vehicle types/colors and activity, (3) Pedestrian presence across both periods, (4) Key movements with colors and directions. Use LEFT and RIGHT summaries.\n"
-        "- temporal_movements: For each movement in COMBINED MOVEMENT EVIDENCE, include: object_type (car/person/truck/cyclist/etc), color, movement description, distance_px, evidence_seconds. Each movement MUST identify the object type being described.\n"
-        "- If no movements, write: 'static scene - parked/stationary objects only'\n"
-        "- If no hazards, always write: 'none'"
-    )
-    result = call_qwen_text(prompt)
-    merged = result if isinstance(result, dict) else {}
-    merged["annotator_type"] = "ai"
-    merged["scene_id"] = scene_id
-    
-    # Ensure aggregated counts override if LLM gives 0
-    if merged.get("total_vehicles") == 0 and avg_vehicles > 0:
-        merged["total_vehicles"] = avg_vehicles
-    if merged.get("total_pedestrians") == 0 and avg_peds > 0:
-        merged["total_pedestrians"] = avg_peds
-    if merged.get("total_cyclists") == 0 and avg_cyclists > 0:
-        merged["total_cyclists"] = avg_cyclists
-    if merged.get("total_traffic_lights") == 0 and avg_tls > 0:
-        merged["total_traffic_lights"] = avg_tls
-    
-    if not merged.get("temporal_movements") and combined_movements:
-        merged["temporal_movements"] = combined_movements
-    else:
-        merged.setdefault("temporal_movements", combined_movements)
-    merged.setdefault("annotation_confidence", None)
-    return merged
-
-
-def _copy_with_updated_scene_id(src_path, dst_path, scene_id):
-    data = _load_json(src_path)
-    data["scene_id"] = scene_id
-    _dump_json(dst_path, data)
-
-
-def generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECONDS):
-    print("\nGenerating hierarchical cumulative summaries...")
-
-    second_paths = []
-    for sec in range(num_seconds):
-        p = f"output/scene/output_sec_{sec}.json"
-        if os.path.exists(p):
-            second_paths.append(p)
-
-    if not second_paths:
-        print("  No per-second files found. Skipping cumulative generation.")
-        return None
-
-    tree_root = "output/cumulative_tree"
-    os.makedirs(tree_root, exist_ok=True)
-
-    # Level 1: merge every 5 consecutive seconds.
-    level = 1
-    level_dir = os.path.join(tree_root, f"level_{level}")
-    os.makedirs(level_dir, exist_ok=True)
-    current_nodes = []
-
-    total_chunks = math.ceil(len(second_paths) / chunk_seconds)
-    for chunk_idx in range(total_chunks):
-        start_idx = chunk_idx * chunk_seconds
-        chunk = second_paths[start_idx:start_idx + chunk_seconds]
-        if not chunk:
-            continue
-
-        frames_payload = [_normalize_second_frame(p) for p in chunk]
-        span_start = _safe_int(frames_payload[0].get("second"), default=start_idx)
-        span_end = _safe_int(frames_payload[-1].get("second"), default=start_idx + len(chunk) - 1)
-        scene_id = f"video_l1_{span_start:05d}_{span_end:05d}"
-        out_path = os.path.join(level_dir, f"cumulative_{span_start:05d}_{span_end:05d}.json")
-
-        try:
-            cumulative = _build_cumulative_from_seconds(frames_payload, span_start, span_end, scene_id)
-        except Exception as e:
-            print(f"  Level 1 merge error ({scene_id}): {e}")
-            cumulative = {
-                "annotator_type": "ai",
-                "scene_id": scene_id,
-                "time_span": {"start_second": span_start, "end_second": span_end},
-                "environment": "",
-                "lighting": "",
-                "traffic_density": "",
-                "traffic_flow": "",
-                "total_vehicles": 0,
-                "total_pedestrians": 0,
-                "total_cyclists": 0,
-                "total_traffic_lights": 0,
-                "scene_narrative": "",
-                "spatial_description": "",
-                "hazards_and_events": "none",
-                "temporal_movements": [],
-                "annotation_confidence": None,
-            }
-
-        _dump_json(out_path, cumulative)
-        print(f"  Saved L1 cumulative: {out_path}")
-        current_nodes.append({"path": out_path, "start": span_start, "end": span_end})
-
-    # Higher levels: pairwise merge neighboring cumulative files until one remains.
-    level = 2
-    while len(current_nodes) > 1:
-        prev_nodes = current_nodes
-        current_nodes = []
-        level_dir = os.path.join(tree_root, f"level_{level}")
-        os.makedirs(level_dir, exist_ok=True)
-
-        i = 0
-        while i < len(prev_nodes):
-            left = prev_nodes[i]
-            if i + 1 >= len(prev_nodes):
-                # Carry forward odd tail node unchanged.
-                scene_id = f"video_l{level}_{left['start']:05d}_{left['end']:05d}"
-                out_path = os.path.join(level_dir, f"cumulative_{left['start']:05d}_{left['end']:05d}.json")
-                _copy_with_updated_scene_id(left["path"], out_path, scene_id)
-                print(f"  Carried forward: {out_path}")
-                current_nodes.append({"path": out_path, "start": left["start"], "end": left["end"]})
-                i += 1
-                continue
-
-            right = prev_nodes[i + 1]
-            span_start = left["start"]
-            span_end = right["end"]
-            scene_id = f"video_l{level}_{span_start:05d}_{span_end:05d}"
-            out_path = os.path.join(level_dir, f"cumulative_{span_start:05d}_{span_end:05d}.json")
-
-            try:
-                merged = _build_cumulative_from_cumulatives(
-                    _load_json(left["path"]),
-                    _load_json(right["path"]),
-                    scene_id,
-                )
-                merged["time_span"] = {
-                    "start_second": span_start,
-                    "end_second": span_end
-                }
-            except Exception as e:
-                print(f"  Level {level} merge error ({scene_id}): {e}")
-                merged = {
-                    "annotator_type": "ai",
-                    "scene_id": scene_id,
-                    "time_span": {"start_second": span_start, "end_second": span_end},
-                    "environment": "",
-                    "lighting": "",
-                    "traffic_density": "",
-                    "traffic_flow": "",
-                    "total_vehicles": 0,
-                    "total_pedestrians": 0,
-                    "total_cyclists": 0,
-                    "total_traffic_lights": 0,
-                    "scene_narrative": "",
-                    "spatial_description": "",
-                    "hazards_and_events": "none",
-                    "temporal_movements": [],
-                    "annotation_confidence": None,
-                }
-
-            _dump_json(out_path, merged)
-            print(f"  Saved L{level} cumulative: {out_path}")
-            current_nodes.append({"path": out_path, "start": span_start, "end": span_end})
-            i += 2
-
-        level += 1
-
-    final_path = current_nodes[0]["path"]
-    final_summary = _load_json(final_path)
-
-    os.makedirs("output/summaries", exist_ok=True)
-    _dump_json("output/summaries/output_cumulative_mega.json", final_summary)
-
-
-    manifest = {
-        "chunk_seconds": chunk_seconds,
-        "total_seconds_processed": len(second_paths),
-        "final_summary_path": "output/summaries/output_cumulative_mega.json",
-        "tree_root": tree_root
-    }
-    _dump_json("output/cumulative_tree/manifest.json", manifest)
-
-    print("  Saved: output/summaries/output_cumulative_mega.json")
-
-    print("  Saved: output/cumulative_tree/manifest.json")
-    return final_summary
-
-
-def generate_cumulative(num_seconds):
-    """Backward-compatible wrapper."""
-    return generate_hierarchical_cumulative(num_seconds, chunk_seconds=VIDEO_CHUNK_SECONDS)
-
-
-# ── Generate AI cumulative for static image ───────────────────────────────────
+#  Generate AI cumulative for static image 
 def generate_static_cumulative(result):
-    """Convert a single-frame result into CUMULATIVE_SUMMARY_SCHEMA format for AI."""
     ss = result.get("scene_summary", {})
     detections = ss.get("detected_objects", [])
 
-    # Build object_groups from detections — group by type
     from collections import defaultdict
     groups_raw = defaultdict(list)
     for obj in detections:
@@ -1053,41 +756,43 @@ def generate_static_cumulative(result):
 
     object_groups = []
     for otype, objs in groups_raw.items():
-        sizes  = [o.get("size", "medium") for o in objs]
-        typical_size = max(set(sizes), key=sizes.count) if sizes else "medium"
+        is_ped = otype.lower() == "pedestrian"
         positions = [o.get("position", "") for o in objs]
         zones = []
         for p in positions:
             if "Foreground" in p: zones.append("foreground")
             elif "Background" in p: zones.append("background")
-        zone = max(set(zones), key=zones.count) if zones else "foreground"
-        actions = [o.get("action", "static") for o in objs if "action" in o]
+        zone     = max(set(zones), key=zones.count) if zones else "foreground"
+        actions  = [o.get("action", "static") for o in objs if "action" in o]
         behavior = max(set(actions), key=actions.count) if actions else "static"
-        object_groups.append({
-            "group_label":       f"{len(objs)} {otype}(s)",
-            "object_type":       otype,
-            "count":             len(objs),
-            "typical_size":      typical_size,
-            "zone":              zone,
-            "behavior":          behavior
-        })
+        group = {
+            "group_label": f"{len(objs)} {otype}(s)",
+            "object_type": otype,
+            "count":       len(objs),
+            "zone":        zone,
+            "behavior":    behavior,
+        }
+        if not is_ped:
+            sizes = [o.get("size", "medium") for o in objs]
+            group["typical_size"] = max(set(sizes), key=sizes.count) if sizes else "medium"
+        object_groups.append(group)
 
     cumulative = {
-        "annotator_type":         "ai",
-        "scene_id":               "static",
-        "environment":            ss.get("environment", ""),
-        "lighting":               ss.get("lighting", ""),
-        "traffic_density":        ss.get("traffic_density", ""),
-        "traffic_flow":           ss.get("traffic_flow", ""),
-        "total_vehicles":         ss.get("total_vehicles_detected", 0),
-        "total_pedestrians":      ss.get("total_pedestrians_detected", 0),
-        "total_cyclists":         ss.get("total_cyclists_detected", 0),
-        "total_traffic_lights":   ss.get("total_traffic_lights_detected", 0),
-        "object_groups":          object_groups,
-        "scene_narrative":        ss.get("scene_description", ""),
-        "spatial_description":    ss.get("spatial_description", ""),
-        "hazards_and_events":     ss.get("hazards_and_events", "none"),
-        "annotation_confidence":  0.85
+        "annotator_type":       "ai",
+        "scene_id":             "static",
+        "environment":          ss.get("environment", ""),
+        "lighting":             ss.get("lighting", ""),
+        "traffic_density":      ss.get("traffic_density", ""),
+        "traffic_flow":         ss.get("traffic_flow", ""),
+        "total_vehicles":       ss.get("total_vehicles_detected", 0),
+        "total_pedestrians":    ss.get("total_pedestrians_detected", 0),
+        "total_cyclists":       ss.get("total_cyclists_detected", 0),
+        "total_traffic_lights": ss.get("total_traffic_lights_detected", 0),
+        "object_groups":        object_groups,
+        "scene_narrative":      ss.get("scene_description", ""),
+        "spatial_description":  ss.get("spatial_description", ""),
+        "hazards_and_events":   ss.get("hazards_and_events", "none"),
+        "annotation_confidence": 0.85
     }
     os.makedirs("output/summaries", exist_ok=True)
     with open("output/summaries/output_ai_cumulative.json", "w") as f:
@@ -1096,7 +801,7 @@ def generate_static_cumulative(result):
     return cumulative
 
 
-# ── Google Sheets ─────────────────────────────────────────────────────────────
+#  Google Sheets 
 _sheets_service = None
 _spreadsheet_id = None
 
@@ -1123,7 +828,8 @@ def _get_sheets():
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
             if not creds.valid:
                 creds = None
-        except Exception:
+        except (IOError, ValueError) as e:
+            print(f"⚠  Token file invalid: {e}")
             creds = None
 
     if not creds and os.path.exists(OAUTH_FILE):
@@ -1146,8 +852,6 @@ def _get_sheets():
     except Exception as e:
         print(f"⚠  Sheets build failed: {e}")
         return None
-
-
 def _ensure_spreadsheet():
     global _spreadsheet_id
     if _spreadsheet_id:
@@ -1162,7 +866,6 @@ def _ensure_spreadsheet():
     svc = _get_sheets()
     if not svc:
         return None
-
     try:
         body   = {"properties": {"title": f"Scene Annotations {datetime.now():%Y-%m-%d}"}}
         result = svc.spreadsheets().create(body=body).execute()
@@ -1170,7 +873,6 @@ def _ensure_spreadsheet():
         with open(SHEET_ID_FILE, "w") as f:
             f.write(_spreadsheet_id)
         print(f"✓ Created spreadsheet: {_spreadsheet_id}")
-
         svc.spreadsheets().values().update(
             spreadsheetId=_spreadsheet_id,
             range="Sheet1!A1",
@@ -1178,45 +880,43 @@ def _ensure_spreadsheet():
             body={"values": [SHEET_HEADERS]}
         ).execute()
         return _spreadsheet_id
-
     except Exception as e:
         print(f"⚠  Could not create spreadsheet: {e}")
         return None
-
-
 def append_row(summary: dict) -> bool:
-    """
-    Append a CUMULATIVE_SUMMARY_SCHEMA dict as a flat Sheets row.
-    Column order matches SHEET_HEADERS exactly.
-    """
     sid = _ensure_spreadsheet()
     svc = _get_sheets()
     if not sid or not svc:
         return False
     try:
-        # Build object count summary
-        object_groups = summary.get("object_groups", [])
+        object_groups  = summary.get("object_groups", [])
         object_summary = "; ".join([f"{g['count']} {g['object_type']}" for g in object_groups])
-        
+        p_info = summary.get("participant_info", {})
         row = [
             summary.get("annotator_type", "human"),
-            summary.get("participant_id", ""),
+            p_info.get("name",          summary.get("participant_id", "")),
+            p_info.get("country",       ""),
+            p_info.get("age_category",  ""),
+            p_info.get("gender",        ""),
+            p_info.get("profession",    ""),
+            p_info.get("driving_skill", ""),
             summary.get("scene_id", ""),
-            summary.get("environment", ""),
-            summary.get("lighting", ""),
+            summary.get("environment",     ""),
+            summary.get("lighting",        ""),
             summary.get("traffic_density", ""),
-            summary.get("traffic_flow", ""),
-            summary.get("total_vehicles", 0),
-            summary.get("total_pedestrians", 0),
-            summary.get("total_cyclists", 0),
+            summary.get("traffic_flow",    ""),
+            summary.get("total_vehicles",       0),
+            summary.get("total_pedestrians",    0),
+            summary.get("total_cyclists",       0),
             summary.get("total_traffic_lights", 0),
-            summary.get("scene_narrative", ""),
+            summary.get("scene_narrative",    ""),
             summary.get("hazards_and_events", ""),
-            object_summary
+            summary.get("video_review",       ""),
+            object_summary,
         ]
         svc.spreadsheets().values().append(
             spreadsheetId=sid,
-            range="Sheet1!A:N",
+            range="Sheet1!A:T",
             valueInputOption="RAW",
             body={"values": [row]}
         ).execute()
@@ -1225,53 +925,7 @@ def append_row(summary: dict) -> bool:
     except Exception as e:
         print(f"⚠  Sheet append failed: {e}")
         return False
-
-
-# ── Gap Detection (top-N objects only) ───────────────────────────────────────
-def detect_gaps(description, scene_fields, scene_id):
-    """
-    Check if the narrative covers required scene-level fields.
-    Returns: { missing_scene_fields: [...] }
-    """
-
-    # Scene-level fields not yet covered by MCQ (MCQ already captured categorical ones)
-    scene_text_fields = ["scene_narrative", "spatial_description", "hazards_and_events",
-                         "traffic_density", "traffic_flow"]
-
-    # Check which scene text fields are missing from the narrative
-    filled_scene_fields = list(scene_fields.keys())
-
-    prompt = f"""Analyse this traffic scene description written by a human.
-"{description}"
-
-Check if any of these specific details are COMPLETELY ABSENT:
-1. "spatial_description": Did they mention depth layout, foreground/background, lanes, or sidewalks? (If they mention ANY spatial relationships, do NOT flag this).
-2. "hazards_and_events": Did they mention safety concerns or lack thereof? (If they mention anything about the safety or events, do NOT flag this).
-
-Strict rule: DO NOT flag "scene_narrative". The user has already provided the main narrative.
-
-Already answered via dropdowns (do NOT flag these): {json.dumps(filled_scene_fields)}
-
-Return ONLY valid JSON (no markdown):
-{{
-  "missing_scene_fields": ["spatial_description", "hazards_and_events"], // ONLY include those completely absent! If in doubt, assume they answered it.
-  "objects_described_count": 0 // Integer count of how many specific distinct objects the user clearly described (e.g. type + color + position). Example: "white sedan and black SUV" = 2.
-}}
-"""
-
-    try:
-        result = call_qwen_text(prompt)
-        return {
-            "missing_scene_fields":  result.get("missing_scene_fields", []),
-        }
-    except Exception as e:
-        print(f"  Gap detection error: {e}")
-        return {
-            "missing_scene_fields":  scene_text_fields,
-        }
-
-
-# ── Flask ─────────────────────────────────────────────────────────────────────
+#  Flask 
 _scene_b64_cache = {}
 
 def _img_to_b64(path):
@@ -1285,35 +939,26 @@ def _img_to_b64(path):
     return data
 
 
-# (Form moved to templates/form.html)
-
+_whisper_model = whisper.load_model("base") 
 
 flask_app = Flask(__name__)
-
-
 def _find_image(scene_id):
-    for c in [f"output/scene/frame_{scene_id}.jpg", f"output/scene/frame_sec_{scene_id}.jpg", "output/scene/frame_static.jpg"]:
+    for c in [f"output/scene/frame_{scene_id}.jpg",
+              f"output/scene/frame_sec_{scene_id}.jpg",
+              "output/scene/frame_static.jpg"]:
         if os.path.exists(c):
             return c
     return None
-
-
 @flask_app.route("/")
 def serve_form():
     return render_template("form.html")
-
-
 @flask_app.route("/api/scene-image")
 def api_scene_image():
     scene_id = request.args.get("scene_id", "static")
     path = _find_image(scene_id)
     return jsonify({"b64": _img_to_b64(path) if path else None})
-
-
 @flask_app.route("/api/scene-video")
 def api_scene_video():
-    """Return a JSON with a preview URL when a video target exists."""
-    # If DEFAULT_TARGET is a video file and exists, provide preview URL
     target = DEFAULT_TARGET
     if not os.path.exists(target):
         return jsonify({"url": None})
@@ -1322,168 +967,132 @@ def api_scene_video():
         return jsonify({"url": "/video/preview"})
     return jsonify({"url": None})
 
+@flask_app.route("/api/annotated-frames")
+def api_annotated_frames():
+    import glob, re
+    files = glob.glob("output/scene/frame_sec_*_yolo.jpg")
+    if not files:
+        files = [f for f in glob.glob("output/scene/frame_sec_*.jpg") if "_yolo" not in f]
+    frames = []
+    for f in files:
+        m = re.search(r'frame_sec_(\d+)', os.path.basename(f))
+        if m:
+            sec = int(m.group(1))
+            frames.append({"sec": sec, "url": f"/frames/annotated/{sec}"})
+    frames.sort(key=lambda x: x["sec"]) 
+    return jsonify({"frames": frames})
 
+@flask_app.route("/frames/annotated/<int:sec>")
+def frame_annotated(sec):
+    base = os.path.abspath("output/scene")
+    yolo_path  = os.path.join(base, f"frame_sec_{sec}_yolo.jpg")
+    plain_path = os.path.join(base, f"frame_sec_{sec}.jpg")
+    if os.path.exists(yolo_path):
+        return send_file(yolo_path, mimetype="image/jpeg")
+    if os.path.exists(plain_path):
+        return send_file(plain_path, mimetype="image/jpeg")
+    return ("Not found", 404)
 @flask_app.route('/video/preview')
 def video_preview():
-    """Stream the target video file for preview in the form."""
     target = DEFAULT_TARGET
     if not os.path.exists(target):
         return ("Not found", 404)
-    # Use send_file to stream the file directly
     return send_file(target, mimetype='video/mp4', conditional=True)
-
-
-@flask_app.route("/api/detect-gaps", methods=["POST"])
-def api_detect_gaps():
-    data        = request.get_json(force=True)
-    scene_id    = data.get("scene_id", "static")
-    description = data.get("description", "")
-    scene_fields= data.get("scene_fields", {})
-    if not description:
-        return jsonify({"error": "No description provided"}), 400
-    try:
-        result = detect_gaps(description, scene_fields, scene_id)
-        described_count = result.get("objects_described_count", 0)
-
-        # Add up to 3 major objects for the user to describe
-        top_n = 3
-        try:
-            if os.path.exists("output/scene/output_static.json"):
-                with open("output/scene/output_static.json") as f:
-                    d = json.load(f)
-                    scene_sum = d.get("scene_summary", {})
-                    
-                    # Number of objects actually mapped by AI
-                    detected = scene_sum.get("detected_objects", [])
-                    num = len(detected)
-                    
-                    # Alternatively use total vehicles if array is somehow truncated
-                    if num == 0:
-                        num = scene_sum.get("total_vehicles_detected", 0) + scene_sum.get("total_pedestrians_detected", 0) + scene_sum.get("total_cyclists_detected", 0)
-
-                    top_n = min(3, num)
-        except Exception as e:
-            print(f"Failed to load static JSON for object gap count: {e}")
-            top_n = 3
-            
-        remaining_to_ask = max(0, top_n - described_count)
-            
-        if remaining_to_ask > 0:
-            result["missing_objects"] = [{"id": f"obj_{i}", "label": f"Prominent Object {i}"} for i in range(1, remaining_to_ask + 1)]
-
-        return jsonify(result)
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
 @flask_app.route("/api/submit", methods=["POST"])
 def api_submit():
-    data            = request.get_json(force=True)
-    scene_id        = data.get("scene_id", "static")
-    participant_id  = data.get("participant_id", "").strip()
-    narrative       = data.get("narrative", "").strip()
-    scene_fields    = data.get("scene_fields", {})
+    data             = request.get_json(force=True)
+    scene_id         = data.get("scene_id", "static")
+    participant_id   = data.get("participant_id", "").strip()
+    narrative        = data.get("narrative", "").strip()
+    scene_fields     = data.get("scene_fields", {})
     hazards_and_events = data.get("hazards_and_events", "").strip()
-    objects         = data.get("objects", [])  # Array of individual object instances
-    traffic_behavior = data.get("traffic_behavior", "").strip()
-    events_over_time = data.get("events_over_time", "").strip()
+    objects          = data.get("objects", [])
+    video_review     = data.get("video_review", "").strip()
 
     if not participant_id or not narrative:
         return jsonify({"error": "Missing required fields"}), 400
 
     try:
-        # Build object_groups from the detailed objects array
-        # Objects come as individual instances from the form
         from collections import defaultdict
-        object_groups_dict = defaultdict(lambda: {"count": 0, "colors": [], "sizes": [], "positions": [], "actions": [], "raw_instances": []})
-        
+        object_groups_dict = defaultdict(lambda: {
+            "count": 0, "colors": [], "sizes": [], "positions": [], "actions": [], "raw_instances": []
+        })
+
         for obj in objects:
             obj_type = obj.get("object_type", "other")
-            color = obj.get("color")
-            size = obj.get("size")
+            color    = obj.get("color")
+            size     = obj.get("size")
             position = obj.get("position", "")
-            action = obj.get("action")
-            
+            action   = obj.get("action")
             object_groups_dict[obj_type]["count"] += 1
-            if color: object_groups_dict[obj_type]["colors"].append(color)
-            if size: object_groups_dict[obj_type]["sizes"].append(size)
+            if color:    object_groups_dict[obj_type]["colors"].append(color)
+            if size:     object_groups_dict[obj_type]["sizes"].append(size)
             if position: object_groups_dict[obj_type]["positions"].append(position)
-            if action: object_groups_dict[obj_type]["actions"].append(action)
+            if action:   object_groups_dict[obj_type]["actions"].append(action)
             object_groups_dict[obj_type]["raw_instances"].append(obj)
-        
-        # Convert to CUMULATIVE_SUMMARY_SCHEMA format
+
         object_groups = []
         for obj_type, data_dict in object_groups_dict.items():
-            # Determine zone from positions
             zones = set()
             for pos in data_dict["positions"]:
                 if "Foreground" in pos: zones.add("foreground")
                 elif "Midground" in pos: zones.add("midground")
                 elif "Background" in pos: zones.add("background")
             zone = list(zones)[0] if zones else "foreground"
-            
-            # Get most common values
-            colors = data_dict["colors"]
+            colors        = data_dict["colors"]
             typical_color = max(set(colors), key=colors.count) if colors else None
-            sizes = data_dict["sizes"]
-            typical_size = max(set(sizes), key=sizes.count) if sizes else "medium"
-            actions = data_dict["actions"]
-            behavior = max(set(actions), key=actions.count) if actions else "static"
-            
+            sizes         = data_dict["sizes"]
+            typical_size  = max(set(sizes), key=sizes.count) if sizes else "medium"
+            actions       = data_dict["actions"]
+            behavior      = max(set(actions), key=actions.count) if actions else "static"
             object_groups.append({
-                "group_label":       f"{data_dict['count']} {obj_type}(s)",
-                "object_type":       obj_type,
-                "count":             data_dict["count"],
-                "typical_size":      typical_size,
-                "zone":              zone,
-                "behavior":          behavior,
-                "typical_color":     typical_color,
-                "raw_instances":     data_dict["raw_instances"]  # Include raw instance data
+                "group_label":   f"{data_dict['count']} {obj_type}(s)",
+                "object_type":   obj_type,
+                "count":         data_dict["count"],
+                "typical_size":  typical_size,
+                "zone":          zone,
+                "behavior":      behavior,
+                "typical_color": typical_color,
+                "raw_instances": data_dict["raw_instances"]
             })
-        
-        # Count objects by type from the groups
-        total_vehicles = sum(g["count"] for g in object_groups if g["object_type"] in ["car", "van", "truck", "bus", "motorcycle"])
-        total_pedestrians = sum(g["count"] for g in object_groups if g["object_type"] == "pedestrian")
-        total_cyclists = sum(g["count"] for g in object_groups if g["object_type"] == "cyclist")
+
+        total_vehicles      = sum(g["count"] for g in object_groups if g["object_type"] in ["car", "van", "truck", "bus", "motorcycle"])
+        total_pedestrians   = sum(g["count"] for g in object_groups if g["object_type"] == "pedestrian")
+        total_cyclists      = sum(g["count"] for g in object_groups if g["object_type"] == "cyclist")
         total_traffic_lights = sum(g["count"] for g in object_groups if g["object_type"] == "traffic_light")
 
-        # Build CUMULATIVE_SUMMARY_SCHEMA-compatible human summary
         human_summary = {
-            "annotator_type":         "human",
-            "participant_id":         participant_id,
-            "scene_id":               scene_id,
-            "environment":            scene_fields.get("environment", ""),
-            "lighting":               scene_fields.get("lighting", ""),
-            "traffic_density":        scene_fields.get("traffic_density", ""),
-            "traffic_flow":           scene_fields.get("traffic_flow", ""),
-            "total_vehicles":         total_vehicles,
-            "total_pedestrians":      total_pedestrians,
-            "total_cyclists":         total_cyclists,
-            "total_traffic_lights":   total_traffic_lights,
-            "object_groups":          object_groups,
-            "scene_narrative":        narrative,
-            "spatial_description":    "",  # Can be collected via follow-up if needed
-            "hazards_and_events":     hazards_and_events if hazards_and_events else "none",
-            "raw_narrative":          narrative,
-            "raw_objects":            objects,  # Store raw object data for detailed analysis
-            "annotation_confidence":  None
+            "annotator_type":       "human",
+            "participant_id":       participant_id,
+            "participant_info":     data.get("participant_info", {}),
+            "scene_id":             scene_id,
+            "environment":          scene_fields.get("environment", ""),
+            "lighting":             scene_fields.get("lighting", ""),
+            "traffic_density":      scene_fields.get("traffic_density", ""),
+            "traffic_flow":         scene_fields.get("traffic_flow", ""),
+            "total_vehicles":       total_vehicles,
+            "total_pedestrians":    total_pedestrians,
+            "total_cyclists":       total_cyclists,
+            "total_traffic_lights": total_traffic_lights,
+            "object_groups":        object_groups,
+            "scene_narrative":      narrative,
+            "spatial_description":  "",
+            "hazards_and_events":   hazards_and_events if hazards_and_events else "none",
+            "raw_narrative":        narrative,
+            "raw_objects":          objects,
+            "annotation_confidence": None
         }
-        
-        # Add video-specific fields if present
-        if traffic_behavior:
-            human_summary["traffic_behavior"] = traffic_behavior
-        if events_over_time:
-            human_summary["events_over_time"] = events_over_time
 
-        # Local backup
+        if video_review:
+            human_summary["video_review"] = video_review
+
+        os.makedirs("annotations", exist_ok=True)
         fname = f"annotations/{participant_id}_annotation.json"
         with open(fname, "w") as f:
             json.dump(human_summary, f, indent=2)
         print(f"✓ Saved: {fname}")
 
         saved_to_sheets = append_row(human_summary)
-
         return jsonify({"success": True, "sheets": saved_to_sheets})
 
     except Exception as e:
@@ -1491,7 +1100,21 @@ def api_submit():
         return jsonify({"error": str(e)}), 500
 
 
-# ── Server ────────────────────────────────────────────────────────────────────
+@flask_app.route("/api/transcribe", methods=["POST"])
+def api_transcribe():
+    audio = request.files.get("audio")
+    if not audio:
+        return jsonify({"error": "no audio"}), 400
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+        audio.save(f.name)
+        try:
+            result = _whisper_model.transcribe(f.name)
+        finally:
+            os.unlink(f.name)
+    return jsonify({"text": result["text"].strip()})
+
+
+# ngrok Server 
 _ngrok_proc = None
 
 def _cleanup_ngrok():
@@ -1499,21 +1122,21 @@ def _cleanup_ngrok():
     try:
         from pyngrok import ngrok
         ngrok.kill()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠  ngrok kill failed: {e}")
     global _ngrok_proc
     if _ngrok_proc:
         try:
             _ngrok_proc.terminate()
             _ngrok_proc.wait(timeout=2)
-        except Exception:
-            pass
+        except (OSError, ProcessLookupError) as e:
+            print(f"⚠  ngrok process cleanup failed: {e}")
 
 def _try_ngrok(port):
     global _ngrok_proc
     try:
         from pyngrok import ngrok as _ngrok, conf as _ngrok_conf
-        _ngrok_conf.get_default().auth_token = "3CgoRdxOoU7NIRyNklz6KitDJGT_ucohrp9iQkCz44Sjakkw"
+        _ngrok_conf.get_default().auth_token = os.getenv("NGROK_AUTH_TOKEN", "")
         tunnel = _ngrok.connect(port, "http")
         url = tunnel.public_url.replace("http://", "https://")
         print(f"\n  PUBLIC URL (share this): {url}/?scene_id=static")
@@ -1522,6 +1145,7 @@ def _try_ngrok(port):
         pass
     except Exception as e:
         print(f"  pyngrok error: {e}")
+        import traceback; traceback.print_exc()
 
     import subprocess, re
     try:
@@ -1554,17 +1178,376 @@ def start_server(port=SERVER_PORT):
     print(f"  Press Ctrl+C to stop.\n")
 
 
-# ── Video Pipeline ────────────────────────────────────────────────────────────
+# ── Flat cumulative (single Qwen text call over all tracker + per-second data) ─
+def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> dict:
+    """Replace the hierarchical tree with one Qwen text call.
+    All object-level facts come from the tracker; Qwen only writes the narrative."""
+    second_paths = [
+        f"output/scene/output_sec_{s}.json"
+        for s in range(num_seconds)
+        if os.path.exists(f"output/scene/output_sec_{s}.json")
+    ]
+    if not second_paths:
+        print("  No per-second files found. Skipping cumulative.")
+        return {}
+
+    # Authoritative counts from tracker
+    movements = []
+    if get_track_motion_summary is not None:
+        movements = get_track_motion_summary(0, num_seconds + 1) or []
+
+    # Count unique track_ids from per-second JSONs only (excludes micro-tracks
+    # that appear between 1fps samples and inflate the total).
+    vehicle_types = {"car", "vehicle", "truck", "bus", "motorcycle", "van", "taxi"}
+    uv, up, uc, utl = set(), set(), set(), set()
+
+    # Aggregate per-track data for objects_seen list
+    track_agg = {}   # track_id -> {type, colors[], sizes[], actions[], seconds[]}
+
+    # Per-second summary for prompt
+    frame_summaries = []
+    for p in second_paths:
+        d = _load_json(p)
+        ss = d.get("scene_summary", {})
+        sec = _safe_int(d.get("frame"), -1)
+        for obj in ss.get("detected_objects", []) or []:
+            tid    = obj.get("track_id", -1)
+            source = obj.get("source", "yolo")
+
+            # GT-injected objects have no tracker ID.
+            # Synthesize a stable pseudo-ID so they reach objects_seen
+            # and the Qwen cumulative prompt.
+            if tid == -1 and source == "gt_injected":
+                tid = f"gt_{obj.get('object_type','?')}_{obj.get('position','?')}_{sec}"
+
+            if tid == -1:
+                continue
+            t = obj.get("object_type", "").lower()
+            if t in vehicle_types:     uv.add(tid)
+            elif t == "pedestrian":    up.add(tid)
+            elif t == "cyclist":       uc.add(tid)
+            elif t == "traffic_light": utl.add(tid)
+
+            if tid not in track_agg:
+                track_agg[tid] = {"object_type": obj.get("object_type", t),
+                                  "colors": [], "sizes": [], "actions": [], "seconds": []}
+            agg = track_agg[tid]
+            if obj.get("color") and obj["color"] not in ("unknown", ""):
+                agg["colors"].append(obj["color"])
+            if obj.get("size") and obj["size"] not in ("unknown", ""):
+                agg["sizes"].append(obj["size"])
+            if obj.get("action") and obj["action"] not in ("unknown", ""):
+                agg["actions"].append(obj["action"])
+            if sec not in agg["seconds"]:
+                agg["seconds"].append(sec)
+
+        frame_summaries.append({
+            "second":       sec,
+            "vehicles":     ss.get("total_vehicles_detected", 0),
+            "pedestrians":  ss.get("total_pedestrians_detected", 0),
+            "cyclists":     ss.get("total_cyclists_detected", 0),
+            "traffic_flow": ss.get("traffic_flow", ""),
+            "hazards":      ss.get("hazards_and_events", "none"),
+            "description":  (ss.get("scene_description", "") or "")[:120],
+        })
+
+    # Build objects_seen: one entry per unique track_id, most-common color/size/action
+    def _most_common(lst):
+        return max(set(lst), key=lst.count) if lst else "unknown"
+
+    objects_seen = []
+    for tid, agg in sorted(track_agg.items()):
+        entry = {
+            "track_id":    tid,
+            "object_type": agg["object_type"],
+            "action":      _most_common(agg["actions"]),
+            "seen_seconds": sorted(agg["seconds"]),
+        }
+        if agg["object_type"].lower() != "pedestrian":
+            entry["color"] = _most_common(agg["colors"])
+            entry["size"]  = _most_common(agg["sizes"])
+        objects_seen.append(entry)
+
+    env   = (stable_fields or {}).get("environment", "")
+    light = (stable_fields or {}).get("lighting", "")
+    scene_id = f"video_0_{num_seconds - 1}"
+
+    # Split moving vs static so Qwen focuses narrative on motion
+    moving_objects = [o for o in objects_seen
+                      if o.get("action") not in
+                      ("parked", "static", "standing", "stopped", "unknown", "")]
+    static_objects = [o for o in objects_seen if o not in moving_objects]
+
+    env_options      = " | ".join(FIELD_OPTIONS["environment"])
+    lighting_options = " | ".join(FIELD_OPTIONS["lighting"])
+    density_options  = " | ".join(FIELD_OPTIONS["traffic_density"])
+    flow_options     = " | ".join(FIELD_OPTIONS["traffic_flow"])
+
+    prompt = f"""You are writing the final annotation summary for a {num_seconds}-second traffic video.
+Your task: fill the JSON schema below using ONLY the structured data provided.
+Do not invent any object, motion, or event not present in the data.
+
+## SCENE CONTEXT (confirmed)
+environment: {env}
+lighting: {light}
+unique_object_counts:
+  vehicles: {len(uv)}
+  pedestrians: {len(up)}
+  cyclists: {len(uc)}
+  traffic_lights: {len(utl)}
+
+## PER-SECOND OBJECT DATA (sampled — do not extrapolate between samples)
+Each entry contains counts and traffic_flow label for that second.
+description field = Qwen's own description from that frame (truncated).
+{json.dumps(frame_summaries, indent=2)}
+
+## MOVING OBJECTS — focus your narrative on these
+Each entry has: type, color, size, action, speed, direction, seen_seconds.
+All speed/direction values are pre-computed from LiDAR/GPS or tracker.
+Do not reinterpret them.
+{json.dumps(moving_objects, indent=2)}
+
+## STATIC / PARKED OBJECTS — mention briefly
+{json.dumps(static_objects, indent=2)}
+
+## OUTPUT SCHEMA
+Return ONLY valid JSON matching this exact structure.
+No markdown, no explanation, no extra keys.
+{{
+  "scene_id": "{scene_id}",
+  "environment": "<{env_options}>",
+  "lighting": "<{lighting_options}>",
+  "traffic_density": "<{density_options}>",
+  "traffic_flow": "<{flow_options}>",
+  "scene_narrative": "<4 sentences synthesized from the data above. Sentence 1: environment type and overall layout. Sentence 2: each vehicle with its color, size, and action — use exact color/size from moving_objects and static_objects data. Sentence 3: pedestrians and cyclists with their actions. Sentence 4: describe movements using the direction and speed attributes from moving_objects only.>",
+  "spatial_description": "<1 sentence on foreground vs background layout>",
+  "hazards_and_events": "<describe any hazard present in the per-second data, or exactly: none>",
+  "temporal_movements": [
+    {{
+      "object_type": "<type from moving_objects>",
+      "color":       "<color from moving_objects>",
+      "action":      "<action from moving_objects>",
+      "speed":       "<speed label from moving_objects>",
+      "speed_mps":   <speed_mps value or null>,
+      "direction":   "<direction from moving_objects>",
+      "evidence_seconds": [<seen_seconds list from moving_objects>]
+    }}
+  ],
+  "annotation_confidence": <0.9 if most objects have gt_sourced=true, else 0.7>
+}}
+
+RULES:
+1. unique_object_counts are authoritative — do not change them.
+2. temporal_movements: one entry per object in moving_objects. Empty list [] if moving_objects is empty.
+3. Every vehicle in scene_narrative must include its color and size from the data.
+4. Do not describe motion for objects in static_objects.
+5. annotation_confidence = 0.9 if NuScenes GT data was available (check if gt_sourced fields exist), else 0.7.
+"""
+
+    result = call_qwen_text(prompt)
+    cumulative = result if isinstance(result, dict) else {}
+    cumulative["annotator_type"]      = "ai"
+    cumulative["scene_id"]            = scene_id
+    cumulative["time_span"]           = {"start_second": 0, "end_second": num_seconds - 1}
+    cumulative["total_vehicles"]      = len(uv)
+    cumulative["total_pedestrians"]   = len(up)
+    cumulative["total_cyclists"]      = len(uc)
+    cumulative["total_traffic_lights"]= len(utl)
+    cumulative["objects_seen"]        = objects_seen
+    if not cumulative.get("temporal_movements") and movements:
+        cumulative["temporal_movements"] = [
+            {
+                "object_type":      m.get("object_type", "unknown"),
+                "color":            m.get("color", "unknown"),
+                "movement":         f"{m.get('direction','unknown')} at {m.get('speed','unknown')}",
+                "distance_px":      m.get("distance_px", 0.0),
+                "evidence_seconds": m.get("evidence_seconds", []),
+            }
+            for m in movements
+        ]
+
+    #  NuScenes GT validation
+    if _nuscenes_gt_by_frame:
+        import glob as _glob, re as _re
+        from collections import Counter as _Counter
+
+        # Unique GT instances across the whole scene (by visibility tier)
+        gt_all:   dict = {}   # instance_token → semantic_type (all visibility)
+        gt_vis40: dict = {}   # instance_token → semantic_type (≥40% visible only)
+        for fd in _nuscenes_gt_by_frame.values():
+            for ann in fd.get("annotations", []):
+                it, st = ann["instance_token"], ann["semantic_type"]
+                gt_all[it] = st
+                if ann.get("visibility", 0) >= 2:
+                    gt_vis40[it] = st
+
+        # IoU-based track-instance matching across all YOLO frame JSONs
+        track_instances: dict = {}   
+        instance_tracks: dict = {}  
+        for ff in sorted(_glob.glob("output/frames/frame_*.json")):
+            m = _re.match(r".*frame_(\d+)\.json", ff)
+            if not m:
+                continue
+            fidx     = int(m.group(1))
+            frame_gt = _nuscenes_gt_by_frame.get(fidx, {})
+            gt_anns  = [a for a in frame_gt.get("annotations", []) if a.get("visibility", 0) >= 2]
+            if not gt_anns:
+                continue
+            try:
+                with open(ff) as fh:
+                    fd = json.load(fh)
+            except (IOError, json.JSONDecodeError):
+                continue
+            for yo in fd.get("scene_summary", {}).get("detected_objects", []):
+                tid = yo.get("track_id", -1)
+                if tid < 0:
+                    continue
+                ybb = yo.get("bounding_box", {})
+                best_iou, best_it = 0.25, None
+                for ga in gt_anns:
+                    iou = _bbox_iou(ybb, ga.get("bbox_2d", {}))
+                    if iou > best_iou:
+                        best_iou, best_it = iou, ga["instance_token"]
+                if best_it:
+                    track_instances.setdefault(tid, {})
+                    track_instances[tid][best_it] = track_instances[tid].get(best_it, 0) + 1
+                    instance_tracks.setdefault(best_it, {})
+                    instance_tracks[best_it][tid]  = instance_tracks[best_it].get(tid, 0) + 1
+
+        matched_vis40 = set(instance_tracks) & set(gt_vis40)
+        recall        = round(len(matched_vis40) / max(1, len(gt_vis40)), 3)
+        split_tracks  = [
+            {"track_id": t, "matched_instances": list(its)}
+            for t, its in track_instances.items() if len(its) > 1
+        ]
+        fragmented_gt = [
+            {"instance_token": it[:8] + "…", "track_ids": list(tids)}
+            for it, tids in instance_tracks.items() if len(tids) > 1
+        ]
+
+        cumulative["gt_validation"] = {
+            "gt_unique_all":        dict(_Counter(gt_all.values())),
+            "gt_unique_40pct_vis":  dict(_Counter(gt_vis40.values())),
+            "pipeline_recall_40pct": recall,
+            "split_tracks":         split_tracks,
+            "fragmented_gt_objects": fragmented_gt,
+            "note": "Only GT objects with ≥40% visibility used for recall and IoU matching.",
+        }
+        print(f"  GT validation: recall={recall:.1%}, "
+              f"split={len(split_tracks)}, fragmented={len(fragmented_gt)}")
+
+    os.makedirs("output/summaries", exist_ok=True)
+    _dump_json("output/summaries/output_cumulative_mega.json", cumulative)
+    print("  Saved: output/summaries/output_cumulative_mega.json")
+    return cumulative
+
+
+def process_scene(scene_name: str):
+    """
+    NuScenes scene pipeline (sweep-based, no mp4 required):
+      1. process_scene_sweeps  → YOLO + ByteTracker on every CAM_FRONT sweep
+                                 (~12 Hz); writes output/keyframes/*.json
+                                 (one per sample, 2 Hz) + output/keyframe_map.json
+      2. Qwen analyse_frame    → one call per keyframe (sample), reading the
+                                 sample JPG directly via the SDK
+      3. generate_flat_cumulative across all keyframes
+    """
+    if not TRACKER_AVAILABLE or process_scene_sweeps is None:
+        sys.exit("Tracker / nuScenes SDK not available — cannot run scene pipeline.")
+
+    from nuscenes.nuscenes import NuScenes
+
+    if os.path.exists("output"):
+        print("Clearing existing output folder...")
+        shutil.rmtree("output", ignore_errors=True)
+    for _d in ["output", "output/frames", "output/annotated", "output/keyframes",
+               "output/scene", "output/yolo_raw",
+               "output/summaries", "output/cumulative_tree"]:
+        os.makedirs(_d, exist_ok=True)
+
+    print(f"\n🔍 Step 1: YOLO + ByteTracker on scene '{scene_name}' (sweeps)...")
+    process_scene_sweeps(scene_name, dataroot=NUSCENES_DATAROOT, out_dir="output")
+
+    print("\n Step 2: Qwen per-keyframe scene analysis...")
+    with open("output/keyframe_map.json") as f:
+        keyframe_map = json.load(f)
+    if not keyframe_map:
+        sys.exit("No keyframes found in output/keyframe_map.json")
+
+    nusc = NuScenes(version="v1.0-mini", dataroot=NUSCENES_DATAROOT, verbose=False)
+
+    frames_data = []   # list[(sec_label, frame_bgr, yolo_data, frame_idx)]
+    for kf in keyframe_map:
+        sample   = nusc.get("sample", kf["sample_token"])
+        sd       = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
+        img_path = os.path.join(NUSCENES_DATAROOT, sd["filename"])
+        frame    = cv2.imread(img_path)
+
+        kf_json_path = f"output/keyframes/keyframe_{kf['sample_idx']:04d}.json"
+        yolo_data    = None
+        if os.path.exists(kf_json_path):
+            try:
+                with open(kf_json_path) as pf:
+                    yolo_data = _yolo_data_from_frame_result(json.load(pf))
+            except (IOError, json.JSONDecodeError, KeyError) as e:
+                print(f"  ⚠  Keyframe load failed (sample {kf['sample_idx']}): {e}")
+
+        # sample_idx is the per-keyframe label (replaces per-second "sec")
+        frames_data.append((kf["sample_idx"], frame, yolo_data, kf["frame_idx"]))
+
+    # Keyframe 0 synchronously — lock stable fields
+    stable_fields = {}
+    sec0, frame0, yolo0, fidx0 = frames_data[0]
+    if frame0 is not None:
+        r0 = analyse_frame(
+            frame0, str(sec0),
+            out_json_path = f"output/scene/output_sec_{sec0}.json",
+            out_img_path  = f"output/scene/frame_sec_{sec0}.jpg",
+            yolo_data     = yolo0,
+            frame_idx     = fidx0,
+        )
+        ss0 = r0.get("scene_summary", {})
+        stable_fields = {
+            "environment": ss0.get("environment", ""),
+            "lighting":    ss0.get("lighting", ""),
+        }
+        print(f"  Stable fields locked — {stable_fields['environment']}, {stable_fields['lighting']}")
+
+    def _analyse_kf(item):
+        sec, frame, yolo_data, frame_idx = item
+        if frame is None:
+            return
+        try:
+            analyse_frame(
+                frame, str(sec),
+                out_json_path = f"output/scene/output_sec_{sec}.json",
+                out_img_path  = f"output/scene/frame_sec_{sec}.jpg",
+                yolo_data     = yolo_data,
+                frame_idx     = frame_idx,
+                stable_fields = stable_fields,
+            )
+        except Exception as e:
+            print(f"  ⚠  analyse_frame failed (keyframe {sec}): {e}")
+
+    if len(frames_data) > 1:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(_analyse_kf, frames_data[1:]))
+
+    print("\n Step 3: Building flat cumulative summary...")
+    generate_flat_cumulative(len(frames_data), stable_fields=stable_fields)
+
+    _ensure_spreadsheet()
+    start_server()
+    print(f"\nProcessed {len(frames_data)} keyframes. Open the form in browser.")
+    try:
+        while True:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\nStopping.")
+        _cleanup_ngrok()
+
+
 def process_video(path):
-    """
-    Full video pipeline:
-      1. yolo_bytetrack.process_video_frames() — YOLO + GMC + ByteTracker on
-         every Nth frame. Writes output/frame_{idx:06d}.json with track_id + color.
-      2. Per-second Qwen vision analysis — reads each second's frame, enriches
-         with scene description + confirmed colors.
-      3. Hierarchical cumulative summary via Qwen text.
-      4. Flask annotation server.
-    """
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         sys.exit("Error: cannot open video file.")
@@ -1574,7 +1557,6 @@ def process_video(path):
     cap.release()
     print(f"Video: {duration}s @ {fps:.1f} FPS")
 
-    # ── Clear existing output to ensure files are newly created for every run
     if os.path.exists("output"):
         print("Clearing existing output folder...")
         shutil.rmtree("output", ignore_errors=True)
@@ -1584,7 +1566,6 @@ def process_video(path):
                "output/summaries", "output/cumulative_tree"]:
         os.makedirs(_d, exist_ok=True)
 
-    # ── Step 1: YOLO + GMC + ByteTracker (yolo_bytetrack.py) ─────────────────
     if TRACKER_AVAILABLE and process_video_frames is not None:
         try:
             print("\n🔍 Step 1: Running YOLO + GMC + ByteTracker...")
@@ -1594,72 +1575,86 @@ def process_video(path):
                 frame_rate=TRACKER_FRAME_RATE,
             )
         except Exception as e:
-            print(f"  ❌ yolo_bytetrack error: {e}")
+            print(f" yolo_bytetrack error: {e}")
             traceback.print_exc()
     else:
-        print("⚠  yolo_bytetrack unavailable; skipping tracking step.")
+        print(" yolo_bytetrack unavailable; skipping tracking step.")
 
-    # ── Step 2: Per-second Qwen analysis ─────────────────────────────────────
-    print("\n🧠 Step 2: Qwen per-second scene analysis...")
+    print("\n Step 2: Qwen per-second scene analysis...")
+    actual_rate = TRACKER_FRAME_RATE if TRACKER_FRAME_RATE > 0 else min(int(fps), max(15, int(math.floor(fps * 0.5))))
+    step        = max(1, int(round(fps / actual_rate)))
+
+    frames_data = []  
     cap2 = cv2.VideoCapture(path)
     for sec in range(duration):
         cap2.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
         ok, frame = cap2.read()
-        if not ok:
-            break
-
-        # Load pre-computed frame-level detections from yolo_bytetrack if available
-        # Find the closest frame_{idx:06d}.json for this second
-        actual_rate = TRACKER_FRAME_RATE if TRACKER_FRAME_RATE > 0 else min(int(fps), max(15, int(math.floor(fps * 0.5))))
-        step = max(1, int(round(fps / actual_rate)))
         frame_idx_for_sec = int(sec * fps)
-        # Round to nearest tracked frame
-        tracked_idx = (frame_idx_for_sec // step) * step
+        tracked_idx  = (frame_idx_for_sec // step) * step
         precomp_path = f"output/frames/frame_{tracked_idx:06d}.json"
         yolo_data = None
         if os.path.exists(precomp_path):
             try:
                 with open(precomp_path) as pf:
-                    precomp = json.load(pf)
-                yolo_data = _yolo_data_from_frame_result(precomp)
-            except Exception:
-                yolo_data = None
-
-        # Load pre-computed annotated image (YOLO boxes + IDs) for Qwen
-        annotated_img_path = f"output/annotated/frame_{tracked_idx:06d}_track.jpg"
-        annotated_frame = None
-        if os.path.exists(annotated_img_path):
-            annotated_frame = cv2.imread(annotated_img_path)
-
-        analyse_frame(
-            frame,
-            scene_id        = str(sec),
-            out_json_path   = f"output/scene/output_sec_{sec}.json",
-            out_img_path    = f"output/scene/frame_sec_{sec}.jpg",
-            yolo_data       = yolo_data,
-            frame_idx       = frame_idx_for_sec,
-            annotated_frame = annotated_frame,
-        )
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+                    yolo_data = _yolo_data_from_frame_result(json.load(pf))
+            except (IOError, json.JSONDecodeError, KeyError) as e:
+                print(f"  ⚠  Precomputed frame load failed (sec {sec}): {e}")
+        frames_data.append((sec, frame if ok else None, yolo_data, frame_idx_for_sec))
     cap2.release()
 
-    # ── Step 3: Hierarchical cumulative summary ───────────────────────────────
-    print("\n📊 Step 3: Building hierarchical cumulative summary...")
-    generate_hierarchical_cumulative(duration, chunk_seconds=VIDEO_CHUNK_SECONDS)
+    # process second 0 synchronously - lock stable fields 
+    stable_fields = {}
+    sec0, frame0, yolo0, fidx0 = frames_data[0]
+    if frame0 is not None:
+        r0 = analyse_frame(
+            frame0, str(sec0),
+            out_json_path = f"output/scene/output_sec_{sec0}.json",
+            out_img_path  = f"output/scene/frame_sec_{sec0}.jpg",
+            yolo_data     = yolo0,
+            frame_idx     = fidx0,
+        )
+        ss0 = r0.get("scene_summary", {})
+        stable_fields = {
+            "environment": ss0.get("environment", ""),
+            "lighting":    ss0.get("lighting", ""),
+        }
+        print(f"  Stable fields locked — {stable_fields['environment']}, {stable_fields['lighting']}")
+
+    #remaining seconds in parallel (no prev_context chain) 
+    def _analyse_sec(item):
+        sec, frame, yolo_data, frame_idx = item
+        if frame is None:
+            return
+        try:
+            analyse_frame(
+                frame, str(sec),
+                out_json_path = f"output/scene/output_sec_{sec}.json",
+                out_img_path  = f"output/scene/frame_sec_{sec}.jpg",
+                yolo_data     = yolo_data,
+                frame_idx     = frame_idx,
+                stable_fields = stable_fields,
+            )
+        except Exception as e:
+            print(f"  ⚠  analyse_frame failed (sec {sec}): {e}")
+
+    if len(frames_data) > 1:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(_analyse_sec, frames_data[1:]))
+
+    #single flat cumulative (one Qwen text call) 
+    print("\n Step 3: Building flat cumulative summary...")
+    generate_flat_cumulative(duration, stable_fields=stable_fields)
 
     _ensure_spreadsheet()
     start_server()
-    print("\nProcessed all frames. Open the form in your browser.")
+    print("\nProcessed all frames. Open the form in browser.")
     try:
         while True:
             time.sleep(5)
     except KeyboardInterrupt:
         print("\nStopping.")
         _cleanup_ngrok()
-
-
-# ── Image Pipeline ────────────────────────────────────────────────────────────
+#  Image Pipeline 
 def process_image(path):
     frame = cv2.imread(path)
     if frame is None:
@@ -1676,13 +1671,9 @@ def process_image(path):
                            scene_id      = "static",
                            out_json_path = "output/scene/output_static.json",
                            out_img_path  = "output/scene/frame_static.jpg")
-
-    # Also write AI cumulative in the shared schema format
     generate_static_cumulative(result)
-
     _ensure_spreadsheet()
     start_server()
-
     try:
         while True:
             time.sleep(5)
@@ -1690,16 +1681,76 @@ def process_image(path):
         print("\nStopping.")
         _cleanup_ngrok()
 
-
 # ── Entry ─────────────────────────────────────────────────────────────────────
-# Edit DEFAULT_TARGET at the top of this file, then run:  python scene_annotator.py
 if __name__ == "__main__":
-    target = DEFAULT_TARGET
-    ext    = os.path.splitext(target)[1].lower()
+    # ── NuScenes mode: python scene_annotator.py --nuscenes [scene_idx] ──
+    if len(sys.argv) > 1 and sys.argv[1] == "--nuscenes":
+        try:
+            from nuscenes.nuscenes import NuScenes as _NuScenes
+            from nuscenes_to_pipeline import list_scenes, scene_to_video
+        except ImportError:
+            sys.exit("nuscenes-devkit not installed. Run: pip install nuscenes-devkit")
+
+        _DATAROOT = "data/v1.0-mini"
+        _VERSION  = "v1.0-mini"
+        _nusc = _NuScenes(version=_VERSION, dataroot=_DATAROOT, verbose=False)
+
+        if len(sys.argv) > 2 and sys.argv[2].lstrip("-").isdigit():
+            _scene_idx = int(sys.argv[2])
+        else:
+            list_scenes(_nusc)
+            try:
+                _scene_idx = int(input(f"\nEnter scene number (0–{len(_nusc.scene)-1}): ").strip())
+            except (ValueError, KeyboardInterrupt):
+                sys.exit("Cancelled.")
+
+        _scene_name = _nusc.scene[_scene_idx]["name"]
+        _out_dir    = os.path.join("output_nuscenes", _scene_name)
+        os.makedirs(_out_dir, exist_ok=True)
+        target = os.path.join(_out_dir, f"{_scene_name}_CAM_FRONT.mp4")
+        print(f"\nConverting NuScenes scene {_scene_idx} ({_scene_name}) → {target}")
+        scene_to_video(_nusc, _scene_idx, "CAM_FRONT", target, fps=2)
+
+        # Load ego-pose sidecar → ground-truth motion compensation
+        _ego_path = target.replace(".mp4", "_ego_poses.json")
+        if os.path.exists(_ego_path) and TRACKER_AVAILABLE:
+            try:
+                with open(_ego_path) as _ef:
+                    _ep = json.load(_ef)
+                set_ego_poses(
+                    _ep["poses"],
+                    _ep["camera_intrinsic"],
+                    _ep["camera_rotation"],
+                    _ep["camera_translation"],
+                )
+                print("  ✅ NuScenes ego-pose motion compensation enabled.")
+            except Exception as _e:
+                print(f"  ⚠  Could not load ego-poses: {_e} — falling back to optical-flow GMC.")
+
+        # Load GT annotation sidecar → Qwen hints + cumulative validation
+        _gt_path = target.replace(".mp4", "_gt_annotations.json")
+        if os.path.exists(_gt_path):
+            try:
+                with open(_gt_path) as _gf:
+                    set_nuscenes_gt(json.load(_gf))
+                print("  ✅ NuScenes GT annotations loaded.")
+            except Exception as _e:
+                print(f"  ⚠  Could not load GT annotations: {_e}")
+
+    else:
+        target = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SCENE
+
+    ext = os.path.splitext(target)[1].lower()
 
     if ext in {".jpg", ".jpeg", ".png", ".webp"}:
         process_image(target)
     elif ext in {".mp4", ".mov", ".avi", ".mkv"}:
+        DEFAULT_TARGET = target
         process_video(target)
     else:
-        sys.exit(f"Unsupported file type: {ext}")
+        # Treat as NuScenes scene name (e.g. "scene-0757"); update DEFAULT_TARGET
+        # so the form's /video/preview can still serve the pre-rendered mp4 if one
+        # exists at the expected location.
+        scene = target
+        DEFAULT_TARGET = f"output_nuscenes/{scene}/{scene}_CAM_FRONT.mp4"
+        process_scene(scene)

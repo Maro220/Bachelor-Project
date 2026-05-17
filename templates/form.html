@@ -82,6 +82,53 @@
             color: var(--ink3); font-size: 14px; margin-bottom: 28px;
         }
 
+        /* ── Frame gallery ── */
+        .gallery-wrap { margin-bottom: 24px; }
+        .gallery-preview {
+            width: 100%; border-radius: var(--radius);
+            border: 1px solid var(--border);
+            display: block; margin-bottom: 10px;
+            background: #000; min-height: 180px; object-fit: contain;
+        }
+        .gallery-label {
+            text-align: center; font-size: 12px; color: var(--ink3);
+            margin-bottom: 8px; font-family: var(--mono);
+        }
+        .frames-strip {
+            display: flex; gap: 7px; overflow-x: auto;
+            padding-bottom: 6px; scroll-snap-type: x mandatory;
+        }
+        .frames-strip::-webkit-scrollbar { height: 4px; }
+        .frames-strip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        .frame-thumb {
+            flex: 0 0 auto; scroll-snap-align: start;
+            border-radius: 6px; overflow: hidden;
+            border: 2px solid var(--border);
+            cursor: pointer; transition: border-color .15s;
+            width: 90px;
+        }
+        .frame-thumb.active { border-color: var(--accent); }
+        .frame-thumb:hover  { border-color: var(--accent2); }
+        .frame-thumb img    { width: 90px; height: 60px; object-fit: cover; display: block; }
+        .frame-thumb .frame-sec {
+            font-size: 10px; font-family: var(--mono);
+            text-align: center; padding: 2px 0;
+            background: var(--surface2); color: var(--ink3);
+        }
+
+        /* ── Inline video (in last section) ── */
+        .section-video {
+            border-radius: var(--radius); overflow: hidden;
+            border: 1px solid var(--border);
+            margin-bottom: 18px; position: relative;
+        }
+        .section-video video { width: 100%; display: block; }
+        .section-video .replay-btn {
+            position: absolute; right: 10px; bottom: 10px;
+            padding: 6px 10px; border-radius: 7px; border: none;
+            background: rgba(0,0,0,.6); color: #fff; cursor: pointer; font-size: 12px;
+        }
+
         /* ── Section labels ── */
         .sec-label {
             font-size: 11px; font-weight: 600; letter-spacing: .1em;
@@ -327,23 +374,37 @@
         .intro-grid .field { margin-bottom: 0; }
 
         /* ── Driving skill rating ── */
-        .skill-rating { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+        .skill-rating { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 8px; }
+        @media (max-width: 520px) { .skill-rating { grid-template-columns: repeat(3, 1fr); } }
         .skill-btn {
-            flex: 1; min-width: 70px;
-            padding: 9px 6px;
+            padding: 14px 6px 10px;
             border: 1.5px solid var(--border);
             border-radius: var(--radius);
             background: var(--surface2);
             font-family: var(--font);
-            font-size: 12px; font-weight: 500;
-            color: var(--ink2);
+            font-size: 11px; font-weight: 600;
+            color: var(--ink3);
             cursor: pointer;
             text-align: center;
             transition: all .18s;
-            line-height: 1.3;
+            display: flex; flex-direction: column; align-items: center; gap: 6px;
+            line-height: 1.2;
         }
-        .skill-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+        .skill-btn .skill-icon {
+            font-size: 20px; line-height: 1;
+        }
+        .skill-btn .skill-bar {
+            width: 100%; height: 3px; border-radius: 2px;
+            background: var(--border); margin-top: 6px; overflow: hidden;
+        }
+        .skill-btn .skill-bar-fill {
+            height: 100%; border-radius: 2px;
+            background: var(--border); transition: background .18s;
+        }
+        .skill-btn:hover { border-color: var(--accent2); color: var(--ink); background: var(--accent-bg); }
+        .skill-btn:hover .skill-bar-fill { background: var(--accent2); }
         .skill-btn.selected { border-color: var(--accent); background: var(--accent); color: #fff; }
+        .skill-btn.selected .skill-bar-fill { background: rgba(255,255,255,.6); }
 
         /* ── Step indicator ── */
         .step-indicator {
@@ -372,6 +433,38 @@
             display: inline-flex; align-items: center; gap: 6px;
         }
         .btn-back:hover { border-color: var(--accent); color: var(--accent); }
+
+        /* ── Voice input ── */
+        .voice-row {
+            display: flex; gap: 8px; align-items: flex-start;
+        }
+        .voice-row textarea {
+            flex: 1; margin-top: 0;
+        }
+        .btn-mic {
+            flex: 0 0 auto;
+            width: 42px; height: 42px;
+            border-radius: 8px; border: 1.5px solid var(--border);
+            background: var(--surface2); color: var(--ink2);
+            font-size: 18px; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: all .15s; padding: 0;
+            font-family: var(--font);
+        }
+        .btn-mic:hover { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
+        .btn-mic.recording {
+            background: var(--err-bg); border-color: var(--err); color: var(--err);
+            animation: micPulse 1s infinite;
+        }
+        .btn-mic:disabled { opacity: .5; cursor: not-allowed; }
+        .voice-hint {
+            font-size: 11px; color: var(--ink3); margin-top: 4px;
+            display: flex; align-items: center; gap: 4px;
+        }
+        @keyframes micPulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(181,32,32,.3); }
+            50%       { opacity: .8; box-shadow: 0 0 0 5px rgba(181,32,32,0); }
+        }
     </style>
 </head>
 <body>
@@ -392,10 +485,12 @@
     <div class="page-slide">
     <div class="intro-body">
 
-        <div class="step-indicator" id="stepIndicator1">
-            <div class="step-dot active" id="dot1"></div>
-            <div class="step-line" id="line1"></div>
-            <div class="step-dot" id="dot2"></div>
+        <div class="step-indicator">
+            <div class="step-dot active"></div>
+            <div class="step-line"></div>
+            <div class="step-dot"></div>
+            <div class="step-line"></div>
+            <div class="step-dot"></div>
         </div>
 
         <div class="intro-welcome">
@@ -418,12 +513,11 @@
                 <select id="p_age" required>
                     <option value="">— select —</option>
                     <option>Under 18</option>
-                    <option>18–24</option>
-                    <option>25–34</option>
-                    <option>35–44</option>
-                    <option>45–54</option>
-                    <option>55–64</option>
-                    <option>65 or older</option>
+                    <option>18–22</option>
+                    <option>23–27</option>
+                    <option>28–35</option>
+                    <option>36–45</option>
+                    <option>45+</option>
                 </select>
             </div>
             <div class="field">
@@ -432,8 +526,6 @@
                     <option value="">— select —</option>
                     <option>Female</option>
                     <option>Male</option>
-                    <option>Non-binary / third gender</option>
-                    <option>Prefer not to say</option>
                 </select>
             </div>
             <div class="field">
@@ -445,11 +537,26 @@
         <div class="field" style="margin-bottom:24px">
             <label>How do you rate your driving skills? <span class="req">*</span></label>
             <div class="skill-rating" id="skillRating">
-                <button type="button" class="skill-btn" data-value="non-driver" onclick="selectSkill(this)">🚶 Non-driver</button>
-                <button type="button" class="skill-btn" data-value="beginner" onclick="selectSkill(this)">🟡 Beginner</button>
-                <button type="button" class="skill-btn" data-value="competent" onclick="selectSkill(this)">🔵 Competent</button>
-                <button type="button" class="skill-btn" data-value="experienced" onclick="selectSkill(this)">🟢 Experienced</button>
-                <button type="button" class="skill-btn" data-value="expert" onclick="selectSkill(this)">⭐ Expert</button>
+                <button type="button" class="skill-btn" data-value="non-driver" onclick="selectSkill(this)">
+                    Non-driver
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:10%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="beginner" onclick="selectSkill(this)">
+                    Beginner
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:30%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="competent" onclick="selectSkill(this)">
+                    Competent
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:55%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="experienced" onclick="selectSkill(this)">
+                    Experienced
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:80%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="expert" onclick="selectSkill(this)">
+                    Expert
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:100%"></div></div>
+                </button>
             </div>
             <input type="hidden" id="p_driving_skill" value="">
         </div>
@@ -472,9 +579,11 @@
 
         <!-- Step indicator (page 2 view) -->
         <div class="step-indicator" style="margin-bottom:20px">
-            <div class="step-dot active" id="dot1b"></div>
+            <div class="step-dot active"></div>
             <div class="step-line done-line"></div>
-            <div class="step-dot active" id="dot2b"></div>
+            <div class="step-dot active"></div>
+            <div class="step-line"></div>
+            <div class="step-dot"></div>
         </div>
 
         <div id="imgContainer"></div>
@@ -505,8 +614,6 @@
                     <option>night without lighting</option>
                 </select>
             </div>
-
-
             <div class="field">
                 <label for="f_traffic_density">Traffic density</label>
                 <select id="f_traffic_density" onchange="renderConditionalQuestions()">
@@ -526,11 +633,10 @@
                     <option>slow-moving</option>
                     <option>stopped</option>
                     <option>mixed</option>
-                    <option>one-directional</option>
-                    <option>bidirectional</option>
                 </select>
             </div>
         </div>
+        <div id="conditionalSceneBlock"></div>
 
         <hr class="divider">
 
@@ -550,8 +656,14 @@
             <label for="narrative">Your detailed description <span class="req">*</span>
                 <span class="hint">Be as specific as a police report — colors, sizes, positions, actions</span>
             </label>
-            <textarea id="narrative" rows="8"
-                placeholder="Example: This is a busy urban intersection captured during bright daylight. In the foreground center, a white medium-sized sedan is stopped at a red traffic light. To its left, a silver SUV is also waiting. A pedestrian in a blue jacket is crossing the road at the designated crossing in the foreground left. In the background right, a large red delivery truck is parked on the pavement. The traffic light overhead is showing red. There are no visible hazards, though the parked truck slightly obstructs the rightmost lane..."></textarea>
+            <!-- VOICE: narrative -->
+            <div class="voice-row">
+                <textarea id="narrative" rows="8"
+                    placeholder="Example: This is a busy urban intersection captured during bright daylight. In the foreground center, a white medium-sized sedan is stopped at a red traffic light. To its left, a silver SUV is also waiting. A pedestrian in a blue jacket is crossing the road at the designated crossing in the foreground left. In the background right, a large red delivery truck is parked on the pavement. The traffic light overhead is showing red. There are no visible hazards, though the parked truck slightly obstructs the rightmost lane..."></textarea>
+                <button type="button" class="btn-mic" id="mic_narrative"
+                    onclick="toggleVoice('narrative')" title="Click to record, click again to stop">🎤</button>
+            </div>
+            <div class="voice-hint">🎤 Click the mic to dictate — text will be transcribed and appended automatically</div>
             <div class="word-counter" id="wordCounter">
                 <span><span id="wordCount">0</span> / 40 words minimum</span>
                 <span id="wordStatus" style="color:#888">keep going…</span>
@@ -599,31 +711,68 @@
                 <label for="f_hazards">Describe the hazards or safety concerns <span class="req">*</span>
                     <span class="hint">What hazards? Where? Who is at risk?</span>
                 </label>
-                <textarea id="f_hazards" rows="3" placeholder="Describe any hazards, unusual events, obstacles, or dangerous situations in detail..."></textarea>
-            </div>
-        </div>
-
-        <div id="videoOnlyFields" style="display:none">
-            <hr class="divider">
-            <div class="sec-label">Video-specific observations</div>
-            <div class="field">
-                <label for="f_traffic_behavior">Describe the traffic flow and vehicle behavior <span class="req">*</span>
-                    <span class="hint">Smooth flow? Congestion? Speed patterns? Lane changes? Conflicts?</span>
-                </label>
-                <textarea id="f_traffic_behavior" rows="3" placeholder="Describe how traffic flows across the video, any notable vehicle behaviors, interactions, or congestion patterns..."></textarea>
-            </div>
-            <div class="field">
-                <label for="f_events_over_time">Describe any events that change over time <span class="hint">(optional)</span></label>
-                <textarea id="f_events_over_time" rows="2" placeholder="e.g. A car enters from the left at 3s and stops at the junction. Pedestrians begin crossing at 7s..."></textarea>
+                <!-- VOICE: hazards -->
+                <div class="voice-row">
+                    <textarea id="f_hazards" rows="3" placeholder="Describe any hazards, unusual events, obstacles, or dangerous situations in detail..."></textarea>
+                    <button type="button" class="btn-mic" id="mic_f_hazards"
+                        onclick="toggleVoice('f_hazards')" title="Click to record, click again to stop">🎤</button>
+                </div>
+                <div class="voice-hint">🎤 Click the mic to dictate</div>
             </div>
         </div>
 
         <hr class="divider">
 
-        <!-- ── Submit ── -->
+        <!-- ── Next ── -->
         <div class="btn-row">
             <button class="btn-back" onclick="goToPage1()">← Back</button>
-            <button class="btn btn-primary" id="submitBtn" onclick="submitForm()" disabled>
+            <button class="btn btn-primary" id="nextToVideoBtn" onclick="goToPage3()">
+                Next → Video observations
+            </button>
+        </div>
+        <div class="status" id="statusPage2"></div>
+
+    </div>
+    </div><!-- end page 2 -->
+
+    <!-- ════════════════════════════════════════════
+         PAGE 3 — Video-specific observations
+    ════════════════════════════════════════════ -->
+    <div class="page-slide">
+    <div class="body">
+
+        <!-- Step indicator (page 3 view) -->
+        <div class="step-indicator" style="margin-bottom:20px">
+            <div class="step-dot active"></div>
+            <div class="step-line done-line"></div>
+            <div class="step-dot active"></div>
+            <div class="step-line done-line"></div>
+            <div class="step-dot active"></div>
+        </div>
+
+        <div class="sec-label">Video-specific observations</div>
+        <p style="font-size:12px;color:var(--ink3);margin-bottom:14px">Watch the full video below, then review your annotations.</p>
+
+        <div id="sectionVideoContainer"></div>
+
+        <div class="field">
+            <label for="f_video_review">Now after watching it as a video, do you need to add/change any of your annotations?
+                <span class="hint">any change in objects? movements? environment? etc.</span>
+            </label>
+            <!-- VOICE: video review -->
+            <div class="voice-row">
+                <textarea id="f_video_review" rows="5" placeholder="Note any additions, corrections, or new observations from watching the full video — or leave blank if nothing changes."></textarea>
+                <button type="button" class="btn-mic" id="mic_f_video_review"
+                    onclick="toggleVoice('f_video_review')" title="Click to record, click again to stop">🎤</button>
+            </div>
+            <div class="voice-hint">🎤 Click the mic to dictate</div>
+        </div>
+
+        <hr class="divider">
+
+        <div class="btn-row">
+            <button class="btn-back" onclick="backToPage2()">← Back</button>
+            <button class="btn btn-primary" id="submitBtn" onclick="submitForm()">
                 Submit annotation
             </button>
         </div>
@@ -638,8 +787,9 @@
             <h2>Annotation submitted</h2>
             <p id="doneMsg">Your responses have been saved.</p>
         </div>
+
     </div>
-    </div><!-- end page 2 -->
+    </div><!-- end page 3 -->
 
     </div><!-- end pages-track -->
     </div><!-- end pages-outer -->
@@ -648,7 +798,6 @@
 <script>
 // ═══════════════════════════════════════════════════════════════
 // QUESTION CONFIG SCHEMA
-// Add new object types or questions here — no HTML changes needed.
 // ═══════════════════════════════════════════════════════════════
 
 const OBJECT_CLASSES = [
@@ -665,11 +814,7 @@ const OBJECT_CLASSES = [
     { value: 'other',        label: 'Other' },
 ];
 
-// Fields per object instance — keyed by type
-// Keys: id, label, type (select|text|radio), options, required, condition
-// condition(type) → bool: whether this field applies
 const INSTANCE_FIELDS = {
-    // ── Always-present fields ──
     _always: [
         {
             id: 'position', label: 'Position in frame', type: 'select', required: true,
@@ -683,8 +828,6 @@ const INSTANCE_FIELDS = {
             condition: t => !['traffic_light','road_sign','other'].includes(t)
         },
     ],
-
-    // ── Vehicles (car, van, truck, bus, motorcycle) ──
     _vehicle: {
         applies: t => ['car','van','truck','bus','motorcycle'].includes(t),
         fields: [
@@ -711,8 +854,6 @@ const INSTANCE_FIELDS = {
             },
         ]
     },
-
-    // ── Pedestrian ──
     _pedestrian: {
         applies: t => t === 'pedestrian',
         fields: [
@@ -731,8 +872,6 @@ const INSTANCE_FIELDS = {
             },
         ]
     },
-
-    // ── Cyclist ──
     _cyclist: {
         applies: t => t === 'cyclist',
         fields: [
@@ -751,8 +890,6 @@ const INSTANCE_FIELDS = {
             },
         ]
     },
-
-    // ── Traffic Light ──
     _traffic_light: {
         applies: t => t === 'traffic_light',
         fields: [
@@ -772,8 +909,6 @@ const INSTANCE_FIELDS = {
             },
         ]
     },
-
-    // ── Road Sign ──
     _road_sign: {
         applies: t => t === 'road_sign',
         fields: [
@@ -793,8 +928,6 @@ const INSTANCE_FIELDS = {
             },
         ]
     },
-
-    // ── Other ──
     _other: {
         applies: t => t === 'other',
         fields: [
@@ -806,8 +939,6 @@ const INSTANCE_FIELDS = {
     },
 };
 
-// Scene-level conditional questions removed per design decision —
-// hazards/safety covered in dedicated section; scene layout redundant with narrative.
 const SCENE_QUESTIONS = [];
 
 // ═══════════════════════════════════════════════════════════════
@@ -815,24 +946,22 @@ const SCENE_QUESTIONS = [];
 // ═══════════════════════════════════════════════════════════════
 
 const SCENE_ID = new URLSearchParams(location.search).get('scene_id') || 'static';
-
 document.getElementById('sceneIdLabel').textContent = 'scene: ' + SCENE_ID;
 
 // ── Multi-page navigation ──
 function goToPage2() {
-    const name   = document.getElementById('p_name').value.trim();
-    const country = document.getElementById('p_country').value.trim();
-    const age    = document.getElementById('p_age').value;
-    const gender = document.getElementById('p_gender').value;
+    const name       = document.getElementById('p_name').value.trim();
+    const country    = document.getElementById('p_country').value.trim();
+    const age        = document.getElementById('p_age').value;
+    const gender     = document.getElementById('p_gender').value;
     const profession = document.getElementById('p_profession').value;
-    const skill  = document.getElementById('p_driving_skill').value;
+    const skill      = document.getElementById('p_driving_skill').value;
 
-    const statusEl = document.getElementById('statusPage1');
     if (!name)       { showStatusP1('Please enter your full name.', 'warn'); return; }
     if (!country)    { showStatusP1('Please enter your country of residence.', 'warn'); return; }
     if (!age)        { showStatusP1('Please select your age category.', 'warn'); return; }
     if (!gender)     { showStatusP1('Please select your gender.', 'warn'); return; }
-    if (!profession) { showStatusP1('Please select your profession.', 'warn'); return; }
+    if (!profession) { showStatusP1('Please enter your profession.', 'warn'); return; }
     if (!skill)      { showStatusP1('Please rate your driving skills.', 'warn'); return; }
 
     showStatusP1('', '');
@@ -842,6 +971,45 @@ function goToPage2() {
 
 function goToPage1() {
     document.getElementById('pagesTrack').style.transform = 'translateX(0)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function backToPage2() {
+    document.getElementById('pagesTrack').style.transform = 'translateX(-100%)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function goToPage3() {
+    const narrative  = document.getElementById('narrative').value.trim();
+    const wordCount  = narrative ? narrative.trim().split(/\s+/).length : 0;
+    const env        = document.getElementById('f_environment').value;
+    const lighting   = document.getElementById('f_lighting').value;
+    const hazardsYN  = document.getElementById('f_hazards_yn').value;
+    const show2 = msg => { document.getElementById('statusPage2').textContent = msg; document.getElementById('statusPage2').className = 'status warn'; };
+
+    if (wordCount < 40)  { show2(`Please write at least 40 words in your description (currently ${wordCount}).`); return; }
+    const sentenceCount = (narrative.match(/[.!?]+(\s|$)/g) || []).length;
+    if (sentenceCount < 2 || (sentenceCount > 0 && wordCount / sentenceCount < 6)) {
+        show2('Please write in full sentences — not a list of keywords.'); return;
+    }
+    if (!env || !lighting) { show2('Please fill in Environment and Lighting.'); return; }
+    if (!hazardsYN)        { show2('Please indicate whether there are hazards.'); return; }
+    if (hazardsYN === 'yes' && !document.getElementById('f_hazards').value.trim()) {
+        show2('Please describe the hazards.'); return;
+    }
+    const objects = collectObjects();
+    if (objects.length < 3) { show2('Please provide details for at least 3 objects.'); return; }
+    let missingReq = 0;
+    objects.forEach(obj => {
+        if (!obj.position) missingReq++;
+        if (['car','van','truck','bus','motorcycle'].includes(obj.object_type) && (!obj.color || !obj.size)) missingReq++;
+        if (obj.object_type === 'traffic_light' && !obj.signal_state) missingReq++;
+        if (obj.object_type === 'road_sign' && !obj.sign_type) missingReq++;
+    });
+    if (missingReq > 0) { show2(`Please complete all required fields in the objects section (${missingReq} missing).`); return; }
+
+    document.getElementById('statusPage2').className = 'status';
+    document.getElementById('pagesTrack').style.transform = 'translateX(-200%)';
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -857,49 +1025,74 @@ function showStatusP1(msg, type) {
     el.className = 'status' + (msg ? ' ' + type : '');
 }
 
-// Load media (video preferred, fallback to image)
+let isVideo = false;
+
+// ── Load annotated frame gallery at top ──
 (async () => {
     const c = document.getElementById('imgContainer');
+    try {
+        const r  = await fetch('/api/annotated-frames');
+        const d  = await r.json();
+        const frames = d.frames || [];
+
+        if (frames.length > 0) {
+            isVideo = true;
+            document.getElementById('sceneIdLabel').textContent = 'scene: video · ' + frames.length + ' frames';
+
+            const thumbs = frames.map(f =>
+                `<div class="frame-thumb" id="thumb_${f.sec}" onclick="selectFrame(${f.sec},'${f.url}')">
+                    <img src="${f.url}" alt="${f.sec}s" loading="lazy">
+                    <div class="frame-sec">${f.sec}s</div>
+                </div>`
+            ).join('');
+
+            c.innerHTML = `
+                <div class="gallery-wrap">
+                    <img id="galleryPreview" class="gallery-preview"
+                         src="${frames[0].url}" alt="Annotated frame">
+                    <div class="gallery-label" id="galleryLabel">Second 0 — click a thumbnail to jump</div>
+                    <div class="frames-strip">${thumbs}</div>
+                </div>`;
+
+            document.getElementById('thumb_' + frames[0].sec)?.classList.add('active');
+        } else {
+            const ri = await fetch('/api/scene-image?scene_id=' + encodeURIComponent(SCENE_ID));
+            const di = await ri.json();
+            c.innerHTML = di.b64
+                ? `<img class="scene-img" src="data:image/jpeg;base64,${di.b64}" alt="Scene">`
+                : `<div class="no-img">No annotated frames found</div>`;
+        }
+    } catch (e) {
+        c.innerHTML = `<div class="no-img">Could not load frames</div>`;
+        console.error(e);
+    }
+
     try {
         const rv = await fetch('/api/scene-video?scene_id=' + encodeURIComponent(SCENE_ID));
         const dv = await rv.json();
         if (dv && dv.url) {
-            // Render HTML5 video player with replay button
-            c.innerHTML = `
-                <div style="position:relative">
-                    <video id="sceneVideo" class="scene-img" controls playsinline>
-                        <source src="${dv.url}" type="video/mp4">
-                        Your browser does not support the video tag.
-                    </video>
-                    <button id="replayBtn" style="position:absolute;right:12px;bottom:12px;padding:8px 10px;border-radius:8px;border:none;background:rgba(0,0,0,0.6);color:#fff;cursor:pointer">Replay</button>
-                </div>`;
-            document.getElementById('replayBtn').addEventListener('click', function(){
-                const v = document.getElementById('sceneVideo');
-                if (v) { v.currentTime = 0; v.play(); }
-            });
-            // Show video-specific fields
-            const vf = document.getElementById('videoOnlyFields'); if (vf) vf.style.display = 'block';
-            // Update badge to indicate this is a video scene
-            document.getElementById('sceneIdLabel').textContent = 'scene: video';
-            return;
+            const vc = document.getElementById('sectionVideoContainer');
+            if (vc) {
+                vc.innerHTML = `
+                    <div class="section-video">
+                        <video id="sectionVideo" controls playsinline>
+                            <source src="${dv.url}" type="video/mp4">
+                        </video>
+                        <button class="replay-btn" onclick="
+                            const v=document.getElementById('sectionVideo');
+                            if(v){v.currentTime=0;v.play();}">↺ Replay</button>
+                    </div>`;
+            }
         }
-    } catch (e) {
-        console.warn('Video preview not available', e);
-    }
-
-    // Fallback to image
-    try {
-        const r = await fetch('/api/scene-image?scene_id=' + encodeURIComponent(SCENE_ID));
-        const d = await r.json();
-        if (d.b64) {
-            c.innerHTML = `<img class="scene-img" src="data:image/jpeg;base64,${d.b64}" alt="Scene to annotate">`;
-        } else {
-            c.innerHTML = `<div class="no-img">No image found for scene "${SCENE_ID}"</div>`;
-        }
-    } catch {
-        c.innerHTML = `<div class="no-img">Could not load media</div>`;
-    }
+    } catch (e) { console.warn('Video not available for last section', e); }
 })();
+
+function selectFrame(sec, url) {
+    document.getElementById('galleryPreview').src = url;
+    document.getElementById('galleryLabel').textContent = `Second ${sec}`;
+    document.querySelectorAll('.frame-thumb').forEach(t => t.classList.remove('active'));
+    document.getElementById('thumb_' + sec)?.classList.add('active');
+}
 
 // ── Word counter + checklist ──
 document.getElementById('narrative').addEventListener('input', updateWordCount);
@@ -922,7 +1115,6 @@ function updateWordCount() {
         statusEl.style.color = 'var(--ok)';
     }
 
-    // Update checklist pills
     document.querySelectorAll('.check-pill').forEach(pill => {
         const keys = pill.dataset.keys.split(',');
         const found = keys.some(k => lower.includes(k.trim()));
@@ -934,23 +1126,20 @@ function updateWordCount() {
 let objectCount = 0;
 
 function getFormState() {
-    // Collect current form state for conditional rendering
     const objectTypes = new Set();
     const objectActions = new Set();
     document.querySelectorAll('.obj-card').forEach(card => {
         const id   = card.id;
         const type = document.getElementById(id + '_type')?.value;
         if (type) objectTypes.add(type);
-        // check instance actions
         card.querySelectorAll('select[id$="_action"]').forEach(sel => {
             if (sel.value) objectActions.add(sel.value);
         });
     });
     return {
-        environment:          document.getElementById('f_environment').value,
-        lighting:             document.getElementById('f_lighting').value,
-        weather:              document.getElementById('f_weather').value,
-        traffic_density:      document.getElementById('f_traffic_density').value,
+        environment:           document.getElementById('f_environment').value,
+        lighting:              document.getElementById('f_lighting').value,
+        traffic_density:       document.getElementById('f_traffic_density').value,
         hasType_traffic_light: objectTypes.has('traffic_light'),
         hasType_pedestrian:    objectTypes.has('pedestrian'),
         hasType_cyclist:       objectTypes.has('cyclist'),
@@ -961,11 +1150,10 @@ function getFormState() {
 function renderConditionalQuestions() {
     const state   = getFormState();
     const block   = document.getElementById('conditionalSceneBlock');
+    if (!block) return;
     const active  = SCENE_QUESTIONS.filter(q => q.trigger(state));
-
     if (active.length === 0) { block.innerHTML = ''; return; }
 
-    // Group by tag
     const byTag = {};
     active.forEach(q => {
         if (!byTag[q.tag]) byTag[q.tag] = [];
@@ -973,11 +1161,9 @@ function renderConditionalQuestions() {
     });
 
     let html = `<div class="sec-label">Scene context questions</div>`;
-
     Object.entries(byTag).forEach(([tag, qs]) => {
         html += `<div class="conditional-section">
             <div class="sec-label" style="font-size:10px;margin-bottom:10px">${tag}</div>`;
-
         qs.forEach(q => {
             const reqMark = q.required ? '<span class="req">*</span>' : '';
             html += `<div class="conditional-q">
@@ -985,9 +1171,7 @@ function renderConditionalQuestions() {
                     <span class="q-tag">${tag}</span>
                     ${q.label} ${reqMark}
                 </div>`;
-
             if (q.type === 'select') {
-                // Preserve existing value if re-rendering
                 const existing = document.getElementById(q.id)?.value || '';
                 html += `<select id="${q.id}" ${q.required ? 'required' : ''} style="font-size:13px">
                     <option value="">— select —</option>
@@ -1000,13 +1184,10 @@ function renderConditionalQuestions() {
                     value="${existing}"
                     style="font-size:13px" ${q.required ? 'required' : ''}>`;
             }
-
             html += `</div>`;
         });
-
         html += `</div>`;
     });
-
     block.innerHTML = html;
 }
 
@@ -1016,11 +1197,11 @@ function addObject() {
     if (count >= 20) { showStatus('Maximum 20 objects allowed.', 'warn'); return; }
 
     objectCount++;
-    const objId    = 'obj_' + objectCount;
-    const isMandatory = count < 3;  // first 3 cards cannot be removed
-    const card  = document.createElement('div');
-    card.className = 'obj-card';
-    card.id = objId;
+    const objId       = 'obj_' + objectCount;
+    const isMandatory = count < 3;
+    const card        = document.createElement('div');
+    card.className    = 'obj-card';
+    card.id           = objId;
 
     card.innerHTML = `
         <div class="obj-card-header">
@@ -1056,20 +1237,17 @@ function removeObject(objId) {
 }
 
 function updateInstanceFields(objId) {
-    const type     = document.getElementById(objId + '_type').value;
-    const rawCount = parseInt(document.getElementById(objId + '_count').value) || 1;
-    const count    = Math.min(Math.max(rawCount, 1), 10);
+    const type      = document.getElementById(objId + '_type').value;
+    const rawCount  = parseInt(document.getElementById(objId + '_count').value) || 1;
+    const count     = Math.min(Math.max(rawCount, 1), 10);
     const container = document.getElementById(objId + '_instances');
 
     if (!type) { container.innerHTML = ''; return; }
 
-    // Find applicable field groups
     const fieldGroups = [];
     fieldGroups.push({ fields: INSTANCE_FIELDS._always.filter(f => !f.condition || f.condition(type)) });
     Object.values(INSTANCE_FIELDS).forEach(group => {
-        if (group && group.applies && group.applies(type)) {
-            fieldGroups.push(group);
-        }
+        if (group && group.applies && group.applies(type)) fieldGroups.push(group);
     });
 
     container.innerHTML = '';
@@ -1123,8 +1301,7 @@ function updateInstanceFields(objId) {
 }
 
 function validateObjectCount() {
-    const count = document.getElementById('objList').querySelectorAll('.obj-card').length;
-    document.getElementById('submitBtn').disabled = count < 3;
+    // validation handled in goToPage3()
 }
 
 // Initialize with 3 default object cards
@@ -1132,9 +1309,9 @@ for (let i = 0; i < 3; i++) addObject();
 
 // ── Hazards toggle ──
 function toggleHazardsDescription() {
-    const yn   = document.getElementById('f_hazards_yn').value;
+    const yn    = document.getElementById('f_hazards_yn').value;
     const field = document.getElementById('hazardsDescriptionField');
-    const ta   = document.getElementById('f_hazards');
+    const ta    = document.getElementById('f_hazards');
     if (yn === 'yes') {
         field.style.display = 'block';
         ta.required = true;
@@ -1148,10 +1325,10 @@ function toggleHazardsDescription() {
 // ── Data collection ──
 function collectMCQ() {
     return {
-        environment:    document.getElementById('f_environment').value,
-        lighting:       document.getElementById('f_lighting').value,
-        traffic_density:document.getElementById('f_traffic_density').value,
-        traffic_flow:   document.getElementById('f_traffic_flow').value,
+        environment:     document.getElementById('f_environment').value,
+        lighting:        document.getElementById('f_lighting').value,
+        traffic_density: document.getElementById('f_traffic_density').value,
+        traffic_flow:    document.getElementById('f_traffic_flow').value,
     };
 }
 
@@ -1164,9 +1341,8 @@ function collectObjects() {
         if (!type) return;
 
         for (let i = 1; i <= count; i++) {
-            const fid = `${objId}_item_${i}`;
+            const fid      = `${objId}_item_${i}`;
             const instance = { instance_id: fid, object_type: type };
-            // Collect all rendered fields for this instance
             card.querySelectorAll(`[id^="${fid}_"]`).forEach(el => {
                 const key = el.id.replace(fid + '_', '');
                 instance[key] = el.value || null;
@@ -1191,47 +1367,10 @@ async function submitForm() {
     const participantId = document.getElementById('p_name').value.trim();
     const narrative     = document.getElementById('narrative').value.trim();
     const hazardsYN     = document.getElementById('f_hazards_yn').value;
+    const objects       = collectObjects();
 
-    if (!participantId) { showStatus('Please go back and enter your name.', 'warn'); return; }
+    if (!participantId) { showStatus('Missing participant name — please go back.', 'warn'); return; }
 
-    const wordCount = narrative ? narrative.split(/\s+/).filter(w => w).length : 0;
-    if (wordCount < 40) { showStatus(`Please write at least 40 words in your description (currently ${wordCount}).`, 'warn'); return; }
-    // Reject keyword dumps: require at least 2 proper sentences (avg ≥6 words each)
-    const sentenceCount = (narrative.match(/[.!?]+(\s|$)/g) || []).length;
-    const avgWordsPerSentence = sentenceCount > 0 ? wordCount / sentenceCount : 0;
-    if (sentenceCount < 2 || avgWordsPerSentence < 6) {
-        showStatus('Please write in full, descriptive sentences — not a list of keywords. Describe the scene as if explaining it to someone who cannot see it.', 'warn'); return;
-    }
-
-    const env     = document.getElementById('f_environment').value;
-    const lighting = document.getElementById('f_lighting').value;
-    if (!env || !lighting) { showStatus('Please fill in the required scene conditions (Environment, Lighting).', 'warn'); return; }
-
-    if (!hazardsYN) { showStatus('Please indicate whether there are hazards.', 'warn'); return; }
-    if (hazardsYN === 'yes' && !document.getElementById('f_hazards').value.trim()) {
-        showStatus('Please describe the hazards.', 'warn'); return;
-    }
-
-    if (isVideo && !document.getElementById('f_traffic_behavior').value.trim()) {
-        showStatus('Please describe the traffic flow for this video.', 'warn'); return;
-    }
-
-    const objects = collectObjects();
-    if (objects.length < 3) { showStatus('Please provide details for at least 3 objects.', 'warn'); return; }
-
-    // Check required instance fields
-    let missingReq = 0;
-    objects.forEach(obj => {
-        if (!obj.position) missingReq++;
-        if (['car','van','truck','bus','motorcycle'].includes(obj.object_type)) {
-            if (!obj.color || !obj.size) missingReq++;
-        }
-        if (obj.object_type === 'traffic_light' && !obj.signal_state) missingReq++;
-        if (obj.object_type === 'road_sign' && !obj.sign_type) missingReq++;
-    });
-    if (missingReq > 0) { showStatus(`Please complete all required fields in the objects section (${missingReq} field(s) missing).`, 'warn'); return; }
-
-    // Submit
     const btn = document.getElementById('submitBtn');
     btn.disabled = true;
     btn.innerHTML = '<span class="spin"></span> Saving…';
@@ -1258,8 +1397,7 @@ async function submitForm() {
         };
 
         if (isVideo) {
-            payload.traffic_behavior    = document.getElementById('f_traffic_behavior').value.trim();
-            payload.events_over_time    = document.getElementById('f_events_over_time').value.trim();
+            payload.video_review = document.getElementById('f_video_review').value.trim();
         }
 
         const r = await fetch('/api/submit', {
@@ -1295,6 +1433,148 @@ function showStatus(msg, type) {
     const el = document.getElementById('status');
     el.textContent = msg;
     el.className = 'status' + (msg ? ' ' + type : '');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VOICE INPUT — Whisper via /api/transcribe
+// ═══════════════════════════════════════════════════════════════
+
+let activeRecorder  = null;
+let activeStream    = null;
+let activeFieldId   = null;
+
+async function toggleVoice(fieldId) {
+    const btn = document.getElementById('mic_' + fieldId);
+
+    // If currently recording this field → stop it
+    if (activeRecorder && activeFieldId === fieldId) {
+        activeRecorder.stop();
+        return;
+    }
+
+    // If recording a different field → stop that one first
+    if (activeRecorder) {
+        activeRecorder.stop();
+        await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Request mic access
+    try {
+        activeStream  = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+        alert('Microphone access denied. Please allow microphone access in your browser settings.');
+        return;
+    }
+
+    // Pick best supported MIME type
+    const mimeType = ['audio/webm;codecs=opus','audio/webm','audio/ogg','audio/mp4']
+        .find(t => MediaRecorder.isTypeSupported(t)) || '';
+
+    activeRecorder = new MediaRecorder(activeStream, mimeType ? { mimeType } : {});
+    activeFieldId  = fieldId;
+    const chunks   = [];
+
+    // UI: recording state
+    btn.classList.add('recording');
+    btn.textContent = '⏹';
+    btn.title = 'Click to stop recording';
+
+    activeRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+    // Silence auto-stop state (populated below, cleaned up in onstop)
+    let silenceTimer = null;
+    let audioCtx     = null;
+
+    activeRecorder.onstop = async () => {
+        if (silenceTimer) clearInterval(silenceTimer);
+        if (audioCtx && audioCtx.state !== 'closed') audioCtx.close().catch(() => {});
+
+        // Reset all mic buttons immediately
+        document.querySelectorAll('.btn-mic').forEach(b => {
+            b.classList.remove('recording');
+            b.textContent = '🎤';
+            b.title = 'Click to record, click again to stop';
+        });
+
+        // Stop all mic tracks
+        activeStream?.getTracks().forEach(t => t.stop());
+
+        if (chunks.length === 0) {
+            activeRecorder = null;
+            activeStream   = null;
+            return;
+        }
+
+        // Show processing state on this button
+        btn.disabled    = true;
+        btn.textContent = '⏳';
+
+        const blob     = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        const formData = new FormData();
+        formData.append('audio', blob, 'recording.webm');
+
+        try {
+            const res  = await fetch('/api/transcribe', { method: 'POST', body: formData });
+            if (!res.ok) throw new Error('Server error ' + res.status);
+            const data = await res.json();
+
+            if (data.text && data.text.trim()) {
+                const ta = document.getElementById(fieldId);
+                // Append to existing text, or set fresh
+                const existing = ta.value.trim();
+                ta.value = existing
+                    ? existing + ' ' + data.text.trim()
+                    : data.text.trim();
+                // Trigger listeners (word counter, etc.)
+                ta.dispatchEvent(new Event('input'));
+                ta.focus();
+            } else if (data.error) {
+                alert('Transcription error: ' + data.error);
+            }
+        } catch (err) {
+            alert('Transcription failed: ' + err.message + '\nMake sure /api/transcribe is running.');
+        }
+
+        btn.disabled    = false;
+        btn.textContent = '🎤';
+        activeRecorder  = null;
+        activeStream    = null;
+        activeFieldId   = null;
+    };
+
+    // ── Silence auto-stop: stop after SILENCE_MS of quiet ──
+    try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const src      = audioCtx.createMediaStreamSource(activeStream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        src.connect(analyser);
+        const buf = new Uint8Array(analyser.fftSize);
+
+        const SILENCE_RMS  = 4;      // ~ -50 dB; tweak if it cuts you off
+        const SILENCE_MS   = 3000;   // 3s of quiet after speech
+        let   lastSpeechAt = null;
+
+        silenceTimer = setInterval(() => {
+            if (!activeRecorder || activeRecorder.state !== 'recording') return;
+            analyser.getByteTimeDomainData(buf);
+            let sumSq = 0;
+            for (let i = 0; i < buf.length; i++) {
+                const v = buf[i] - 128;
+                sumSq += v * v;
+            }
+            const rms = Math.sqrt(sumSq / buf.length);
+            const now = Date.now();
+            if (rms > SILENCE_RMS) lastSpeechAt = now;
+            if (lastSpeechAt && now - lastSpeechAt > SILENCE_MS) {
+                activeRecorder.stop();
+            }
+        }, 100);
+    } catch (e) {
+        console.warn('Silence auto-stop unavailable:', e);
+    }
+
+    activeRecorder.start();
 }
 </script>
 </body>
