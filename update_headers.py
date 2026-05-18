@@ -1,31 +1,31 @@
-import os
+"""
+One-shot admin script: clear row 1 of the Google Sheet and write the canonical
+header row from scene_annotator.SHEET_HEADERS so the two can never drift.
+
+Run after changing SHEET_HEADERS in scene_annotator.py:
+    python update_headers.py
+"""
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+from scene_annotator import SHEET_HEADERS
+
 CREDENTIALS_FILE = "credentials.json"
-SHEET_ID_FILE = "spreadsheet_id.txt"
+SHEET_ID_FILE    = "spreadsheet_id.txt"
 
 creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE)
-svc = build("sheets", "v4", credentials=creds)
+svc   = build("sheets", "v4", credentials=creds)
 
 with open(SHEET_ID_FILE) as f:
     sid = f.read().strip()
 
-HEADERS = [
-    "Annotator Type", "Participant ID", "Scene ID",
-    "Environment", "Lighting",
-    "Traffic Density", "Traffic Flow",
-    "Total Vehicles", "Total Pedestrians", "Total Cyclists",
-    "Total Traffic Lights",
-    "Scene Narrative", "Spatial Description", "Hazards and Events"
-]
-
+last_col = chr(ord("A") + len(SHEET_HEADERS) - 1)
 svc.spreadsheets().values().clear(spreadsheetId=sid, range="Sheet1!1:1").execute()
 svc.spreadsheets().values().update(
     spreadsheetId=sid,
     range="Sheet1!A1",
     valueInputOption="RAW",
-    body={"values": [HEADERS]}
+    body={"values": [SHEET_HEADERS]}
 ).execute()
 
-print("Headers successfully updated in Sheet1!")
+print(f"✓ Wrote {len(SHEET_HEADERS)} headers to Sheet1!A1:{last_col}1")

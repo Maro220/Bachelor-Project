@@ -716,13 +716,6 @@ class TrackState:
         return self._smoothed_v  
 
     def speed_label(self) -> str:
-        # Traffic lights are stationary by domain truth — the rotation-only
-        # GMC homography (compute_gmc) doesn't cancel forward-motion parallax,
-        # and GT doesn't enrich traffic_light, so pixel motion would otherwise
-        # leak through as "moving".
-        if self.obj_type == "traffic_light":
-            return "stationary"
-
         ema_v = self.velocity_px_per_frame()
         avg_v = None
         if len(self.positions) >= 2:
@@ -740,8 +733,6 @@ class TrackState:
         return "fast"
 
     def direction_label(self) -> str:
-        if self.obj_type == "traffic_light":
-            return "stationary"
         speed = self.speed_label()
         if speed in ("stationary", "unknown"):
             return "stationary"
@@ -1229,25 +1220,22 @@ def draw_tracks(frame_bgr: np.ndarray, frame_data: Dict) -> np.ndarray:
 
         source = obj.get("source", "yolo")
 
-        # Prefer canonical_id (stable across track fragments via instance_token
-        # dedup, written by _assign_canonical_and_redraw). Fall back to
-        # track_id for pre-canonical renders or YOLO-only objects without one.
-        cid = obj.get("canonical_id")
-        if cid is None or cid == -1:
-            cid = obj.get("track_id", obj.get("id", "?"))
-
         if source == "gt_injected":
             color = (0, 165, 255)           # orange
-            label = f"#{cid} GT-inject"
+            tid   = obj.get("track_id", "?")
+            label = f"t{tid} GT-inject"
         elif obj.get("gt_type_override"):
             color = (0, 255, 255)           # yellow
-            label = f"#{cid} GT-type"
+            tid   = obj.get("track_id", "?")
+            label = f"t{tid} GT-type"
         elif obj.get("gt_sourced"):
             color = (0, 255, 128)           # green
-            label = f"#{cid}"
+            tid   = obj.get("track_id", "?")
+            label = f"t{tid}"
         else:
             color = (255, 255, 255)         # white
-            label = f"#{cid}"
+            tid   = obj.get("track_id", obj.get("id", "?"))
+            label = f"t{tid}"
 
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
         (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
@@ -1257,98 +1245,6 @@ def draw_tracks(frame_bgr: np.ndarray, frame_data: Dict) -> np.ndarray:
         cv2.putText(canvas, label, (x1 + 2, ly), font, 0.45,
                     color, 1, cv2.LINE_AA)
     return canvas
-
-
-def _identity_key(det: Dict) -> Optional[str]:
-    """Stable identity for a detection: instance_token if GT-confirmed,
-    else yolo_track_{track_id} for YOLO-only tracks. None when neither
-    is available (untracked transient detection)."""
-    it  = det.get("instance_token", "")
-    tid = det.get("track_id", -1)
-    if it:
-        return it
-    if isinstance(tid, int) and tid != -1:
-        return f"yolo_{tid}"
-    return None
-
-
-def _assign_canonical_and_redraw(
-    sd_records: list,
-    dataroot:   str,
-    frames_dir: str,
-    annotated_dir: str,
-    keyframes_dir: str,
-) -> None:
-    """
-    Walk per-sweep JSONs in temporal order, allocate a small-integer
-    canonical_id per (instance_token | yolo_track_id) by first appearance,
-    write canonical_id back into every detection, then redraw annotated
-    images with the canonical labels. Keyframe JSONs are also rewritten
-    so downstream Qwen / mega-summary code sees the same IDs.
-    """
-    import glob, re
-
-    frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.json")))
-    if not frame_files:
-        return
-
-    # PASS 1: identity → canonical_id by first appearance
-    identity_to_canonical: Dict[str, int] = {}
-    next_id = 1
-    for ff in frame_files:
-        with open(ff) as f:
-            data = json.load(f)
-        for det in data.get("scene_summary", {}).get("detected_objects", []):
-            key = _identity_key(det)
-            if key is None:
-                continue
-            if key not in identity_to_canonical:
-                identity_to_canonical[key] = next_id
-                next_id += 1
-
-    # PASS 2: stamp canonical_id back, redraw annotated images
-    # Build frame_idx → sd lookup so we can reload originals
-    sd_by_idx = {i: sd for i, sd in enumerate(sd_records)}
-
-    for ff in frame_files:
-        m = re.search(r"frame_(\d+)\.json", os.path.basename(ff))
-        if not m:
-            continue
-        fidx = int(m.group(1))
-
-        with open(ff) as f:
-            data = json.load(f)
-        for det in data.get("scene_summary", {}).get("detected_objects", []):
-            key = _identity_key(det)
-            det["canonical_id"] = identity_to_canonical.get(key, -1) if key else -1
-
-        with open(ff, "w") as f:
-            json.dump(data, f, indent=2)
-
-        # Redraw annotated frame with canonical labels
-        sd = sd_by_idx.get(fidx)
-        if sd is None:
-            continue
-        img_path = os.path.join(dataroot, sd["filename"])
-        frame    = cv2.imread(img_path)
-        if frame is None:
-            continue
-        canvas = draw_tracks(frame, data)
-        out_jpg = os.path.join(annotated_dir, f"frame_{fidx:06d}_track.jpg")
-        cv2.imwrite(out_jpg, canvas)
-
-    # Mirror canonical_id into keyframe JSONs (consumed by analyse_frame)
-    for kff in sorted(glob.glob(os.path.join(keyframes_dir, "keyframe_*.json"))):
-        with open(kff) as f:
-            data = json.load(f)
-        for det in data.get("scene_summary", {}).get("detected_objects", []):
-            key = _identity_key(det)
-            det["canonical_id"] = identity_to_canonical.get(key, -1) if key else -1
-        with open(kff, "w") as f:
-            json.dump(data, f, indent=2)
-
-    print(f"  ✓ {len(identity_to_canonical)} canonical IDs assigned across "
-          f"{len(frame_files)} sweep frames")
 
 
 def process_scene_sweeps(
@@ -1473,15 +1369,6 @@ def process_scene_sweeps(
 
     with open(os.path.join(out_dir, "keyframe_map.json"), "w") as f:
         json.dump(keyframe_map, f, indent=2)
-
-    # Canonical IDs: instance_token (or yolo_track_X) → small int, allocated by
-    # first appearance. Rewrites per-sweep + keyframe JSONs and redraws annotated
-    # images so the same physical object carries the same label across all
-    # keyframes shown to human annotators, even when ByteTrack fragments it
-    # into multiple track_ids.
-    _assign_canonical_and_redraw(
-        sd_records, dataroot, frames_dir, annotated_dir, keyframes_dir,
-    )
 
     global_summary = get_track_motion_summary(0, int(duration_secs) + 1)
     summary_path   = os.path.join(out_dir, "tracks_summary.json")

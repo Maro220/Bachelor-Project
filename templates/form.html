@@ -293,23 +293,17 @@
         .btn-primary { background: var(--accent); color: #fff; }
         .btn-secondary { background: var(--surface3); color: var(--ink2); border: 1.5px solid var(--border); }
         .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
-
-        /* ── Spinner ── */
         .spin {
             display: inline-block; width: 13px; height: 13px;
             border: 2px solid currentColor; border-top-color: transparent;
             border-radius: 50%; animation: rot .65s linear infinite;
         }
         @keyframes rot { to { transform: rotate(360deg); } }
-
-        /* ── Status ── */
         .status { margin-top: 14px; padding: 11px 14px; border-radius: var(--radius); font-size: 14px; display: none; }
         .status.info  { display: block; background: #e8f0fd; color: #1a3a8c; }
         .status.ok    { display: block; background: var(--ok-bg); color: var(--ok); }
         .status.warn  { display: block; background: var(--warn-bg); color: var(--warn); }
         .status.err   { display: block; background: var(--err-bg); color: var(--err); }
-
-        /* ── Done ── */
         .done { display: none; text-align: center; padding: 48px 20px; }
         .done.on { display: block; }
         .done-check {
@@ -319,13 +313,8 @@
         .done-check svg { width: 26px; height: 26px; stroke: var(--ok); fill: none; stroke-width: 2.5; }
         .done h2 { font-size: 20px; font-weight: 500; color: var(--ok); margin-bottom: 8px; }
         .done p { font-size: 14px; color: var(--ink3); }
-
         hr.divider { border: none; border-top: 1.5px solid var(--border); margin: 24px 0; }
-
-        /* hazard field */
         #hazardsDescriptionField, #videoOnlyFields { transition: all .2s; }
-
-        /* ── Multi-page wrapper ── */
         .pages-outer { overflow: hidden; position: relative; width: 100%; max-width: 100%; }
         .pages-track {
             display: flex;
@@ -339,7 +328,7 @@
             max-width: 100%;
         }
 
-        /* ── Intro (page 1) ── */
+        /* Intro (page 1)*/
         .intro-body {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -373,7 +362,7 @@
         @media (max-width: 520px) { .intro-grid { grid-template-columns: 1fr; } }
         .intro-grid .field { margin-bottom: 0; }
 
-        /* ── Driving skill rating ── */
+        /* Driving skill rating */
         .skill-rating { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 8px; }
         @media (max-width: 520px) { .skill-rating { grid-template-columns: repeat(3, 1fr); } }
         .skill-btn {
@@ -406,7 +395,7 @@
         .skill-btn.selected { border-color: var(--accent); background: var(--accent); color: #fff; }
         .skill-btn.selected .skill-bar-fill { background: rgba(255,255,255,.6); }
 
-        /* ── Step indicator ── */
+        /* Step indicator */
         .step-indicator {
             display: flex; align-items: center; justify-content: center;
             gap: 8px; margin-bottom: 24px;
@@ -422,7 +411,7 @@
         }
         .step-line.done-line { background: var(--accent); }
 
-        /* ── Back button ── */
+        /* Back button */
         .btn-back {
             background: none; border: 1.5px solid var(--border);
             border-radius: var(--radius);
@@ -434,7 +423,7 @@
         }
         .btn-back:hover { border-color: var(--accent); color: var(--accent); }
 
-        /* ── Voice input ── */
+        /* Voice input */
         .voice-row {
             display: flex; gap: 8px; align-items: flex-start;
         }
@@ -475,13 +464,11 @@
         <span class="badge" id="sceneIdLabel">scene: —</span>
     </div>
 
-    <!-- ── Page wrapper ── -->
+    <!--  Page wrapper  -->
     <div class="pages-outer">
     <div class="pages-track" id="pagesTrack">
 
-    <!-- ════════════════════════════════════════════
-         PAGE 1 — About You
-    ════════════════════════════════════════════ -->
+    <!--  PAGE 1 — About You -->
     <div class="page-slide">
     <div class="intro-body">
 
@@ -615,8 +602,8 @@
                 </select>
             </div>
             <div class="field">
-                <label for="f_traffic_density">Traffic density</label>
-                <select id="f_traffic_density" onchange="renderConditionalQuestions()">
+                <label for="f_traffic_density">Traffic density <span class="req">*</span></label>
+                <select id="f_traffic_density" required onchange="renderConditionalQuestions()">
                     <option value="">— select —</option>
                     <option>empty</option>
                     <option>light</option>
@@ -682,7 +669,7 @@
         <hr class="divider">
 
         <!-- ── Objects ── -->
-        <div class="sec-label">Detected objects <span style="font-size:11px;color:var(--ink3);text-transform:none;letter-spacing:0">(minimum 3 required)</span></div>
+        <div class="sec-label">Detected objects <span style="font-size:11px;color:var(--ink3);text-transform:none;letter-spacing:0">(minimum 1 required)</span></div>
         <div class="instruction-box">
             Add one card per <strong>object type</strong>. Set the count, then fill in details for each individual instance. Click <strong>+ Add object</strong> to add more types.
         </div>
@@ -817,6 +804,10 @@ const OBJECT_CLASSES = [
 const INSTANCE_FIELDS = {
     _always: [
         {
+            id: 'tracker_id', label: 'Tracker ID (from visualization)', type: 'text', required: false,
+            placeholder: 'e.g. 45'
+        },
+        {
             id: 'position', label: 'Position in frame', type: 'select', required: true,
             options: ['Foreground Left','Foreground Center','Foreground Right',
                       'Midground Left','Midground Center','Midground Right',
@@ -825,6 +816,10 @@ const INSTANCE_FIELDS = {
         {
             id: 'action', label: 'Action / behavior', type: 'select', required: false,
             options: ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'],
+            // pedestrians can't be "parked" — give them walking-centric verbs instead
+            optionsFor: t => t === 'pedestrian'
+                ? ['walking','stopped','crossing','static','unknown']
+                : ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'],
             condition: t => !['traffic_light','road_sign','other'].includes(t)
         },
     ],
@@ -836,8 +831,12 @@ const INSTANCE_FIELDS = {
                 options: ['white','black','silver','gray','red','blue','green','yellow','orange','brown','beige','mixed / two-tone']
             },
             {
-                id: 'size', label: 'Vehicle size', type: 'select', required: true,
-                options: ['small (e.g. hatchback)','medium (e.g. sedan/SUV)','large (e.g. truck/bus)']
+                id: 'size', label: 'Apparent size in frame', type: 'select', required: true,
+                options: [
+                    'small (distant — occupies a tiny portion of the frame)',
+                    'medium (mid-range — occupies a moderate portion of the frame)',
+                    'large (close-up — fills a significant portion of the frame)'
+                ]
             },
             {
                 id: 'direction', label: 'Direction of travel', type: 'select', required: false,
@@ -993,6 +992,8 @@ function goToPage3() {
         show2('Please write in full sentences — not a list of keywords.'); return;
     }
     if (!env || !lighting) { show2('Please fill in Environment and Lighting.'); return; }
+    const trafficDensity = document.getElementById('f_traffic_density').value;
+    if (!trafficDensity)   { show2('Please select Traffic density.'); return; }
     if (!hazardsYN)        { show2('Please indicate whether there are hazards.'); return; }
     if (hazardsYN === 'yes' && !document.getElementById('f_hazards').value.trim()) {
         show2('Please describe the hazards.'); return;
@@ -1001,6 +1002,10 @@ function goToPage3() {
     if (objects.length < 3) { show2('Please provide details for at least 3 objects.'); return; }
     let missingReq = 0;
     objects.forEach(obj => {
+        // Only the first 2 instances of each object card are mandatory.
+        const m = /_item_(\d+)$/.exec(obj.instance_id || '');
+        const idx = m ? parseInt(m[1], 10) : 1;
+        if (idx > 2) return;
         if (!obj.position) missingReq++;
         if (['car','van','truck','bus','motorcycle'].includes(obj.object_type) && (!obj.color || !obj.size)) missingReq++;
         if (obj.object_type === 'traffic_light' && !obj.signal_state) missingReq++;
@@ -1198,7 +1203,7 @@ function addObject() {
 
     objectCount++;
     const objId       = 'obj_' + objectCount;
-    const isMandatory = count < 3;
+    const isMandatory = count === 0;
     const card        = document.createElement('div');
     card.className    = 'obj-card';
     card.id           = objId;
@@ -1228,12 +1233,30 @@ function addObject() {
 
     list.appendChild(card);
     updateInstanceFields(objId);
+    refreshTypeOptions();
     validateObjectCount();
 }
 
 function removeObject(objId) {
     document.getElementById(objId)?.remove();
+    refreshTypeOptions();
     validateObjectCount();
+}
+
+// Disable object-type options that are already chosen in another card so the
+// same type can't be picked twice. Each card keeps its own current selection
+// enabled (so the user can still see what they chose).
+function refreshTypeOptions() {
+    const selects = document.querySelectorAll('.obj-card select[id$="_type"]');
+    const taken   = new Set(
+        Array.from(selects).map(s => s.value).filter(v => v)
+    );
+    selects.forEach(sel => {
+        Array.from(sel.options).forEach(opt => {
+            if (!opt.value) return;                  // leave placeholder alone
+            opt.disabled = taken.has(opt.value) && opt.value !== sel.value;
+        });
+    });
 }
 
 function updateInstanceFields(objId) {
@@ -1241,6 +1264,9 @@ function updateInstanceFields(objId) {
     const rawCount  = parseInt(document.getElementById(objId + '_count').value) || 1;
     const count     = Math.min(Math.max(rawCount, 1), 10);
     const container = document.getElementById(objId + '_instances');
+
+    // Sync the disabled-options state across all cards whenever a type changes
+    refreshTypeOptions();
 
     if (!type) { container.innerHTML = ''; return; }
 
@@ -1254,14 +1280,19 @@ function updateInstanceFields(objId) {
 
     for (let i = 1; i <= count; i++) {
         const fid   = `${objId}_item_${i}`;
+        const isMandatoryInstance = i <= 1;
+
         const block = document.createElement('div');
         block.className = 'instance-block';
 
         const title = document.createElement('div');
         title.className = 'instance-title';
-        title.textContent = count === 1
+        const optionalTag = isMandatoryInstance
+            ? ''
+            : ' <span style="font-size:10px;opacity:.6;font-weight:400;letter-spacing:0;text-transform:none">(optional)</span>';
+        title.innerHTML = (count === 1
             ? `Details for this ${type.replace('_', ' ')}`
-            : `${type.replace('_', ' ')} #${i} details`;
+            : `${type.replace('_', ' ')} #${i} details`) + optionalTag;
         block.appendChild(title);
 
         const grid = document.createElement('div');
@@ -1272,22 +1303,28 @@ function updateInstanceFields(objId) {
                 const fieldDiv = document.createElement('div');
                 fieldDiv.className = 'field' + (f.fullWidth ? ' full-width' : '');
 
-                const reqStr = f.required ? '<span class="req">*</span>' : '';
+                const fieldRequired = f.required && isMandatoryInstance;
+                const reqStr = fieldRequired ? '<span class="req">*</span>' : '';
                 fieldDiv.innerHTML = `<label for="${fid}_${f.id}">${f.label} ${reqStr}</label>`;
+
+                // optionsFor(type) overrides options on a per-type basis
+                const options = (typeof f.optionsFor === 'function')
+                    ? f.optionsFor(type)
+                    : f.options;
 
                 if (f.type === 'select') {
                     const sel = document.createElement('select');
                     sel.id = `${fid}_${f.id}`;
-                    if (f.required) sel.required = true;
+                    if (fieldRequired) sel.required = true;
                     sel.innerHTML = `<option value="">— select —</option>` +
-                        f.options.map(o => `<option value="${o}">${o}</option>`).join('');
+                        options.map(o => `<option value="${o}">${o}</option>`).join('');
                     fieldDiv.appendChild(sel);
                 } else {
                     const inp = document.createElement('input');
                     inp.type  = 'text';
                     inp.id    = `${fid}_${f.id}`;
                     inp.placeholder = f.placeholder || '';
-                    if (f.required) inp.required = true;
+                    if (fieldRequired) inp.required = true;
                     fieldDiv.appendChild(inp);
                 }
 
@@ -1304,10 +1341,10 @@ function validateObjectCount() {
     // validation handled in goToPage3()
 }
 
-// Initialize with 3 default object cards
-for (let i = 0; i < 3; i++) addObject();
+// Initialize with 2 default object cards
+for (let i = 0; i < 1; i++) addObject();
 
-// ── Hazards toggle ──
+//Hazards toggle
 function toggleHazardsDescription() {
     const yn    = document.getElementById('f_hazards_yn').value;
     const field = document.getElementById('hazardsDescriptionField');
