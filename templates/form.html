@@ -797,7 +797,8 @@ const OBJECT_CLASSES = [
     { value: 'cyclist',      label: 'Cyclist' },
     { value: 'pedestrian',   label: 'Pedestrian' },
     { value: 'traffic_light',label: 'Traffic Light' },
-    { value: 'road_sign',    label: 'Road Sign' },
+    { value: 'cone',         label: 'Cone' },
+    { value: 'barrier',      label: 'Barrier' },
     { value: 'other',        label: 'Other' },
 ];
 
@@ -820,7 +821,7 @@ const INSTANCE_FIELDS = {
             optionsFor: t => t === 'pedestrian'
                 ? ['walking','stopped','crossing','static','unknown']
                 : ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'],
-            condition: t => !['traffic_light','road_sign','other'].includes(t)
+            condition: t => !['traffic_light','cone','barrier','other'].includes(t)
         },
     ],
     _vehicle: {
@@ -908,25 +909,6 @@ const INSTANCE_FIELDS = {
             },
         ]
     },
-    _road_sign: {
-        applies: t => t === 'road_sign',
-        fields: [
-            {
-                id: 'sign_type', label: 'Sign type', type: 'select', required: true,
-                options: ['speed limit','stop','give way / yield','no entry','one way',
-                          'warning / hazard','pedestrian crossing','school zone',
-                          'road works','direction / wayfinding','other']
-            },
-            {
-                id: 'sign_value', label: 'Sign value / text', type: 'text', required: false,
-                placeholder: 'e.g. "30", "STOP", "School 20mph zone"'
-            },
-            {
-                id: 'visibility', label: 'Sign visibility', type: 'select', required: false,
-                options: ['fully visible','partially occluded','damaged','unclear']
-            },
-        ]
-    },
     _other: {
         applies: t => t === 'other',
         fields: [
@@ -1009,7 +991,6 @@ function goToPage3() {
         if (!obj.position) missingReq++;
         if (['car','van','truck','bus','motorcycle'].includes(obj.object_type) && (!obj.color || !obj.size)) missingReq++;
         if (obj.object_type === 'traffic_light' && !obj.signal_state) missingReq++;
-        if (obj.object_type === 'road_sign' && !obj.sign_type) missingReq++;
     });
     if (missingReq > 0) { show2(`Please complete all required fields in the objects section (${missingReq} missing).`); return; }
 

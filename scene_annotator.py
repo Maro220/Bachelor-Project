@@ -25,7 +25,6 @@ try:
         draw_tracks,
         NUSCENES_DATAROOT,
         TARGET_SCENE,
-        merge_gt_into_detections,
         set_nuscenes_gt,
         reset_gt_state,
         _NUSCENES_TO_YOLO_TYPE,
@@ -79,7 +78,7 @@ TOKEN_FILE       = "token.json"
 SHEET_ID_FILE    = "spreadsheet_id.txt"
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVER_PORT      = 7860
-DEFAULT_SCENE    = "scene-0061" 
+DEFAULT_SCENE    = "scene-0757" 
 DEFAULT_TARGET   = f"output_nuscenes/{DEFAULT_SCENE}/{DEFAULT_SCENE}_CAM_FRONT.mp4" 
 
 FIELD_OPTIONS = {
@@ -88,7 +87,7 @@ FIELD_OPTIONS = {
     "traffic_density":["empty", "light", "moderate", "heavy", "gridlock"],
     "traffic_flow":   ["free-flowing", "slow-moving", "stopped", "mixed"],
 }
-OBJECT_TYPE_OPTIONS   = ["car", "van", "truck", "bus", "motorcycle", "cyclist", "pedestrian", "traffic_light", "road_sign", "cone", "barrier", "other"]
+OBJECT_TYPE_OPTIONS   = ["car", "van", "truck", "bus", "motorcycle", "cyclist", "pedestrian", "traffic_light", "cone", "barrier", "other"]
 VEHICLE_CLASSES       = {"car", "van", "motorcycle", "bus", "truck"}
 
 
@@ -160,7 +159,7 @@ def build_nuscenes_gt_2d(nusc, sd_records: list,
     Project NuScenes 3D sample annotations into 2D bboxes for every sweep
     frame (~12 Hz), not just keyframes. 3D boxes are world-frame and valid at
     any timestamp, so each sweep's own ego_pose gives an accurate 2D bbox.
-    Motion attributes (speed_label/speed_mps) come from nusc.box_velocity()
+    Motion attributes (speed_label) come from nusc.box_velocity()
     on the keyframe annotation; direction is computed per-instance from
     sweep-to-sweep pixel displacement.
 
@@ -168,7 +167,7 @@ def build_nuscenes_gt_2d(nusc, sd_records: list,
       { "frames": [ { "frame_video_idx": <frame_idx>,
                       "annotations": [ {instance_token, semantic_type,
                                         visibility, bbox_2d, speed_label,
-                                        speed_mps, direction, action }, ... ]
+                                        direction, action }, ... ]
                     } ] }
     """
     from nuscenes.utils.geometry_utils import view_points
@@ -230,7 +229,6 @@ def build_nuscenes_gt_2d(nusc, sd_records: list,
                 "size":           ann["size"],
                 "rotation":       ann["rotation"],
                 "visibility":     vis_lvl,
-                "speed_mps":      round(speed_mps, 2),
                 "speed_label":    _speed_label(speed_mps),
             })
         sample_annotations[sd["sample_token"]] = anns
@@ -298,7 +296,6 @@ def build_nuscenes_gt_2d(nusc, sd_records: list,
                 "bbox_2d":        {"x1": proj["x1"], "y1": proj["y1"],
                                    "x2": proj["x2"], "y2": proj["y2"]},
                 "speed_label":    ann_3d["speed_label"],
-                "speed_mps":      ann_3d["speed_mps"],
                 "direction":      direction,
                 "action":         action,
             })
@@ -342,16 +339,18 @@ def _yolo_data_from_frame_result(frame_data: dict) -> dict:
             "gt_type_override": d.get("gt_type_override",  False),
             "motion_source":    d.get("motion_source",     ""),
         })
+    _vt = {"car", "van", "motorcycle", "bus", "truck"}
     return {
-        "frame_info":          {"width": 0, "height": 0},
-        "total_objects":       len(dets),
-        "vehicle_count":       ss.get("total_vehicles_detected", 0),
-        "pedestrian_count":    ss.get("total_pedestrians_detected", 0),
-        "cyclist_count":       ss.get("total_cyclists_detected", 0),
-        "traffic_light_count": ss.get("total_traffic_lights_detected", 0),
-        "other_count":         0,
-        "detections":          detections,
-    }
+            "frame_info":          {"width": 0, "height": 0},
+            "total_objects":       len(detections),
+            "vehicle_count":       sum(1 for d in detections if d["type"].lower() in _vt),
+            "pedestrian_count":    sum(1 for d in detections if d["type"].lower() == "pedestrian"),
+            "cyclist_count":       sum(1 for d in detections if d["type"].lower() == "cyclist"),
+            "traffic_light_count": sum(1 for d in detections if d["type"].lower() == "traffic_light"),
+            "other_count":         sum(1 for d in detections if d["type"].lower() not in
+                                    (_vt | {"pedestrian", "cyclist", "traffic_light"})),
+            "detections":          detections,
+        }
 def _safe_parse_json(raw: str) -> dict:
     raw = raw.strip()
     try:
@@ -430,7 +429,7 @@ def call_qwen_text(prompt):
         "format":  "json",
         "stream":  False,
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"temperature": 0.0, "num_ctx": 16384, "num_predict": 3072}
+        "options": {"temperature": 0.0, "num_ctx": 12288, "num_predict": 4096}
     }
     try:
         r = requests.post(OLLAMA_URL, json=payload, timeout=300)
@@ -448,6 +447,22 @@ def call_qwen_text(prompt):
     except (KeyError, ValueError) as e:
         print(f"  ✗ Invalid response format from Ollama (missing message/content): {e}")
         return {}
+
+
+def _call_with_retry(fn, *args, retries: int = 2, wait: int = 10, **kwargs):
+    """Retry an Ollama caller when it returns an empty/falsy result. Useful for
+    transient empty-JSON parses and reload windows after a runner restart. Does
+    not help with sustained OOM — those keep failing for the same reason."""
+    for attempt in range(retries + 1):
+        result = fn(*args, **kwargs)
+        if result:
+            return result
+        if attempt < retries:
+            print(f"  ⚠  Empty/failed Qwen response, retrying in {wait}s "
+                  f"({attempt + 1}/{retries})")
+            time.sleep(wait)
+    return {}
+
 
 def _derive_traffic_density(n_vehicles: int, n_cyclists: int) -> str:
     total = n_vehicles + n_cyclists
@@ -543,7 +558,6 @@ def _build_ego_motion_attrs(frame_idx: int, fps: float) -> dict:
         p2    = _ego_poses[frame_idx]["translation"]
         speed = math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * max(fps, 1.0)
         return {
-            "ego_vehicle_speed_mps": round(speed, 1),
             "ego_vehicle_moving":    speed > 0.3,
         }
     except Exception:
@@ -570,27 +584,28 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
                 "detections": [],
             }
 
-    # Inject GT objects that YOLO missed (NuScenes mode only)
-    if _gt_by_frame() and frame_idx is not None and frame is not None:
-        frame_gt_all = _gt_by_frame().get(frame_idx, {})
-        gt_anns      = frame_gt_all.get("annotations", [])
-        if gt_anns:
-            h_frame, w_frame = frame.shape[:2]
-            yolo_data = merge_gt_into_detections(
-                yolo_data, gt_anns, w_frame, h_frame
-            )
-
     os.makedirs("output/yolo_raw", exist_ok=True)
     with open(f"output/yolo_raw/yolo_raw_{scene_id}.json", "w") as f:
         json.dump(yolo_data, f, indent=2)
 
     cv2.imwrite(out_img_path, frame)
 
-    n_det  = yolo_data["total_objects"]
-    n_veh  = yolo_data["vehicle_count"]
-    n_ped  = yolo_data["pedestrian_count"]
-    n_cyc  = yolo_data["cyclist_count"]
-    n_tl   = yolo_data["traffic_light_count"]
+    # Counts recomputed from yolo_data["detections"] so GT-injected objects are
+    # included. The cached *_count fields in yolo_data come from
+    # run_yolo_and_track's local counters which only see YOLO output, not the
+    # post-merge list.
+    _known_types = (VEHICLE_CLASSES
+                    | {"pedestrian", "cyclist", "traffic_light",
+                       "cone", "barrier"})
+    _dets = yolo_data["detections"]
+    n_veh = sum(1 for d in _dets if d["type"].lower() in VEHICLE_CLASSES)
+    n_ped = sum(1 for d in _dets if d["type"].lower() == "pedestrian")
+    n_cyc = sum(1 for d in _dets if d["type"].lower() == "cyclist")
+    n_tl  = sum(1 for d in _dets if d["type"].lower() == "traffic_light")
+    n_cn  = sum(1 for d in _dets if d["type"].lower() == "cone")
+    n_br  = sum(1 for d in _dets if d["type"].lower() == "barrier")
+    n_oth = sum(1 for d in _dets if d["type"].lower() not in _known_types)
+    n_det = len(_dets)
 
     track_motions = {}
     if not is_static:
@@ -627,8 +642,6 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
             "gt_sourced": _is_gt,
             "source":     d.get("source",    "yolo"),
         }
-        if d.get("speed_mps") is not None:
-            entry["speed_mps"] = d["speed_mps"]
         if tid in track_motions:
             entry["track_history"] = track_motions[tid]
         structured_dets.append(entry)
@@ -647,14 +660,10 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
                 zone = "left" if cx < 0.33 else "right" if cx > 0.66 else "center"
                 gt_confirmed.append({
                     "type":       a["semantic_type"].split(".")[-1],
-                    "full_type":  a["semantic_type"],
                     "zone":       zone,
                     "action":     a.get("action", "unknown"),
-                    "speed_mps":  a.get("speed_mps", 0.0),
                     "speed":      a.get("speed_label", "unknown"),
                     "direction":  a.get("direction", "stationary"),
-                    "dist_m":     a.get("dist_ego_m", None),
-                    "visibility": a.get("visibility", 0),
                     "size":       a.get("size_category", "unknown"),
                 })
 
@@ -729,18 +738,24 @@ RULES:
 """
 
     print(f"  > Qwen analysing frame '{scene_id}'")
+    print(f"    Prompt chars       : {len(prompt)}")
+    print(f"    Prompt est. tokens : ~{int(len(prompt.split()) * 1.3)}")
     try:
-        result = call_qwen_vision(frame, prompt)
+        result = _call_with_retry(call_qwen_vision, frame, prompt)
     except Exception as e:
         print(f"  ! Qwen vision error: {e}")
         result = {}
 
     result["frame"] = scene_id
     ss = result.setdefault("scene_summary", {})
+    ss["total_objects_detected"]        = n_det
     ss["total_vehicles_detected"]       = n_veh
     ss["total_pedestrians_detected"]    = n_ped
     ss["total_cyclists_detected"]       = n_cyc
     ss["total_traffic_lights_detected"] = n_tl
+    ss["total_cones_detected"]          = n_cn
+    ss["total_barriers_detected"]       = n_br
+    ss["total_other_detected"]          = n_oth
     ss["traffic_density"]               = _derive_traffic_density(n_veh, n_cyc)
     # Lock environment from NuScenes; validate lighting against the day/night
     # subset (if Qwen returned something outside it, fall back to default).
@@ -778,7 +793,7 @@ RULES:
         # Propagate provenance flags from merge_gt_into_detections so the
         # strict motion policy and downstream dedup can use them.
         for flag in ("gt_sourced", "gt_type_override", "motion_source",
-                     "instance_token", "gt_iou", "speed_mps",
+                     "instance_token", "gt_iou",
                      "yolo_type_original"):
             if flag in y:
                 obj[flag] = y[flag]
@@ -1387,6 +1402,14 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
                       ("parked", "static", "standing", "stopped", "unknown", "")]
     static_objects = [o for o in objects_seen if o not in moving_objects]
 
+    # Summarize static objects to a type→count dict to avoid dumping 100+
+    # full JSON entries into the prompt. Qwen only needs counts for the
+    # narrative; full detail is only needed for moving objects.
+    static_summary: dict = {}
+    for o in static_objects:
+        t = o.get("object_type", "other")
+        static_summary[t] = static_summary.get(t, 0) + 1
+
     env_options      = " | ".join(FIELD_OPTIONS["environment"])
     lighting_options = " | ".join(FIELD_OPTIONS["lighting"])
     density_options  = " | ".join(FIELD_OPTIONS["traffic_density"])
@@ -1416,8 +1439,8 @@ All speed/direction values are pre-computed from LiDAR/GPS or tracker.
 Do not reinterpret them.
 {json.dumps(moving_objects, indent=2)}
 
-## STATIC / PARKED OBJECTS — mention briefly
-{json.dumps(static_objects, indent=2)}
+## STATIC / PARKED OBJECTS — mention briefly (counts only)
+{json.dumps(static_summary)}
 
 ## OUTPUT SCHEMA
 Return ONLY valid JSON matching this exact structure.
@@ -1437,7 +1460,6 @@ No markdown, no explanation, no extra keys.
       "color":       "<color from moving_objects>",
       "action":      "<action from moving_objects>",
       "speed":       "<speed label from moving_objects>",
-      "speed_mps":   <speed_mps value or null>,
       "direction":   "<direction from moving_objects>",
       "evidence_seconds": [<seen_seconds list from moving_objects>]
     }}
@@ -1453,7 +1475,12 @@ RULES:
 5. annotation_confidence = 0.9 if NuScenes GT data was available (check if gt_sourced fields exist), else 0.7.
 """
 
-    result = call_qwen_text(prompt)
+    print(f"  moving_objects count : {len(moving_objects)}")
+    print(f"  static_objects count : {len(static_objects)}")
+    print(f"  frame_summaries count: {len(frame_summaries)}")
+    print(f"  Prompt chars         : {len(prompt)}")
+    print(f"  Prompt est. tokens   : ~{int(len(prompt.split()) * 1.3)}")
+    result = _call_with_retry(call_qwen_text, prompt)
     cumulative = result if isinstance(result, dict) else {}
     cumulative["annotator_type"]      = "ai"
     cumulative["scene_id"]            = scene_id
@@ -1631,10 +1658,14 @@ def process_scene(scene_name: str):
         sec, frame, yolo_data, frame_idx = item
         if frame is None:
             return
+        out_json = f"output/scene/output_sec_{sec}.json"
+        if os.path.exists(out_json):
+            print(f"   Skipping keyframe {sec} (already analysed)")
+            return
         try:
             analyse_frame(
                 frame, str(sec),
-                out_json_path = f"output/scene/output_sec_{sec}.json",
+                out_json_path = out_json,
                 out_img_path  = f"output/scene/frame_sec_{sec}.jpg",
                 yolo_data     = yolo_data,
                 frame_idx     = frame_idx,
@@ -1642,7 +1673,7 @@ def process_scene(scene_name: str):
             )
         except Exception as e:
             print(f"  ⚠  analyse_frame failed (keyframe {sec}): {e}")
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         list(pool.map(_analyse_kf, frames_data))
     print("\n Step 3: Building flat cumulative summary...")
     generate_flat_cumulative(len(frames_data), stable_fields=stable_fields)

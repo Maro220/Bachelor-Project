@@ -61,7 +61,7 @@ def _init_clip():
 
 TARGET_SCENE             = "scene-0757"   # NuScenes scene NAME (not a path) — SDK resolves frames from data/v1.0-mini/sweeps/CAM_FRONT/
 TRACKER_FRAME_RATE       = 0      # frames per second fed to tracker (0 = auto: all frames at video fps)
-MIN_DETECTION_AREA       = 100    # min pixel area for non-traffic-light detections
+MIN_DETECTION_AREA       = 150    # min pixel area for non-traffic-light detections
 TRACK_ACTIVATION_THRESH  = 0.25   # ByteTrack: min confidence to activate track (raised from 0.15)
 TRACK_BUFFER_FRAMES      = 120    # ByteTrack: frames to keep a lost track alive (~10s at 12 Hz — survives occlusions)
 MATCH_THRESH             = 0.85   # ByteTrack: IoU-DISTANCE threshold for matching (higher = more permissive; default 0.8). Was 0.55 → fragmented.
@@ -363,8 +363,6 @@ def _nuscenes_to_yolo_type(semantic_type: str) -> str:
 
 
 _nuscenes_gt_by_frame: Dict[int, Dict] = {}
-_gt_instance_id_map:   Dict[str, int]  = {}
-_max_track_id_seen:    int             = 0
 
 
 def set_nuscenes_gt(gt_data: dict):
@@ -379,22 +377,8 @@ def set_nuscenes_gt(gt_data: dict):
 
 
 def reset_gt_state():
-    global _nuscenes_gt_by_frame, _gt_instance_id_map, _max_track_id_seen
+    global _nuscenes_gt_by_frame
     _nuscenes_gt_by_frame = {}
-    _gt_instance_id_map   = {}
-    _max_track_id_seen    = 0
-
-
-def _gt_track_id(instance_token: str) -> int:
-    global _max_track_id_seen
-    if not instance_token:
-        return -1
-    tid = _gt_instance_id_map.get(instance_token)
-    if tid is None:
-        _max_track_id_seen += 1
-        tid = _max_track_id_seen
-        _gt_instance_id_map[instance_token] = tid
-    return tid
 
 
 def _bbox_iou(bb1: dict, bb2: dict) -> float:
@@ -428,27 +412,28 @@ def merge_gt_into_detections(
     Pass 1 — IoU-match existing YOLO detections against GT:
         • Stamp gt_sourced=True, motion_source="nuscenes_gt", instance_token
         • Overwrite type with GT type if different  → gt_type_override=True
-        • Overwrite speed, speed_mps, action, direction with GT LiDAR values
+        • Overwrite speed, action, direction with GT LiDAR values
 
     Pass 2 — Inject GT objects YOLO missed entirely:
         • source="gt_injected", instance_token, all GT motion fields set
 
     Counts recomputed from full merged list.
     """
-    visible_gt = [a for a in gt_annotations if a.get("visibility", 0) >= 2]
-    if not visible_gt:
+    # For IoU-match enrichment (pass 1) accept any annotated visibility — YOLO
+    # already detected the box; GT only needs to confirm identity so the
+    # instance_token bridges across ByteTrack fragments.
+    matchable_gt = [a for a in gt_annotations if a.get("visibility", 0) >= 1]
+    # For injection (pass 2) keep the stricter ≥2 threshold so heavily-
+    # occluded boxes don't pollute the tracker.
+    injectable_gt = [a for a in matchable_gt if a.get("visibility", 0) >= 2]
+    if not matchable_gt:
         return yolo_data
+    visible_gt = matchable_gt   # used for stats / iteration where both apply
 
     detections             = yolo_data["detections"]
     matched_gt_tokens: set = set()
     type_corrections       = 0
     gt_enriched            = 0
-
-    global _max_track_id_seen
-    for det in detections:
-        tid = det.get("track_id", -1)
-        if isinstance(tid, int) and tid > _max_track_id_seen:
-            _max_track_id_seen = tid
 
     # PASS 1: enrich existing YOLO detections
     for det in detections:
@@ -484,16 +469,15 @@ def merge_gt_into_detections(
             det["gt_type_override"] = False
 
         det["speed"]     = best_gt.get("speed_label", det.get("speed",     "unknown"))
-        det["speed_mps"] = best_gt.get("speed_mps",   det.get("speed_mps", None))
         det["action"]    = best_gt.get("action",      det.get("action",    "unknown"))
         det["direction"] = best_gt.get("direction",   det.get("direction", "unknown"))
 
         matched_gt_tokens.add(it)
         gt_enriched += 1
 
-    # PASS 2: inject GT objects YOLO missed entirely
+    # PASS 2: inject GT objects YOLO missed entirely (stricter ≥2 visibility)
     injected = 0
-    for ann in visible_gt:
+    for ann in injectable_gt:
         it = ann["instance_token"]
         if it in matched_gt_tokens:
             continue
@@ -524,10 +508,9 @@ def merge_gt_into_detections(
             "area":             max(0, (gt_bbox["x2"] - gt_bbox["x1"]) *
                                        (gt_bbox["y2"] - gt_bbox["y1"])),
             "bounding_box":     gt_bbox,
-            "track_id":         _gt_track_id(it),
+            "track_id":         _canonical_id_for(it),
             "instance_token":   it,
             "speed":            ann.get("speed_label",   "unknown"),
-            "speed_mps":        ann.get("speed_mps",     None),
             "direction":        ann.get("direction",     "stationary"),
             "action":           ann.get("action",        "unknown"),
             "color":            "unknown",
@@ -618,8 +601,12 @@ def get_tracker():
 class TrackState:
     _EMA_ALPHA = 0.30   # smoothing factor: higher = faster response to changes
 
-    def __init__(self, track_id: int, obj_type: str):
-        self.track_id    = track_id
+    def __init__(self, identity: str, obj_type: str):
+        # identity is a string: instance_token for GT-confirmed objects,
+        # f"yolo_{track_id}" for YOLO-only. Promoting identity above
+        # ByteTracker's track_id lets the same physical car keep one
+        # TrackState across fragmented ByteTrack IDs.
+        self.identity    = identity
         self.obj_type    = obj_type
         self.color_votes: List[Tuple[str, float]] = []
         self.locked_color: Optional[str]          = None
@@ -761,15 +748,34 @@ class TrackState:
         elif -135 <= angle < -45:  return "moving down"
         else:                      return "moving left"
 
-_track_states: Dict[int, TrackState] = {}
-def _get_or_create_state(track_id: int, obj_type: str) -> TrackState:
-    if track_id not in _track_states:
-        _track_states[track_id] = TrackState(track_id, obj_type)
-    return _track_states[track_id]
+_track_states: Dict[str, TrackState] = {}   # keyed by identity string
+_identity_to_canonical: Dict[str, int] = {} # identity → small int for display
+_next_canonical_id: int = 1
+
+
+def _get_or_create_state(identity: str, obj_type: str) -> TrackState:
+    if identity not in _track_states:
+        _track_states[identity] = TrackState(identity, obj_type)
+    return _track_states[identity]
+
+
+def _canonical_id_for(identity: str) -> int:
+    """Allocate a stable small-integer ID per identity by first sight.
+    Same identity (instance_token or yolo_{tid}) → same canonical_id forever."""
+    global _next_canonical_id
+    cid = _identity_to_canonical.get(identity)
+    if cid is None:
+        cid = _next_canonical_id
+        _identity_to_canonical[identity] = cid
+        _next_canonical_id += 1
+    return cid
+
 
 def reset_track_states():
-    global _track_states
-    _track_states = {}
+    global _track_states, _identity_to_canonical, _next_canonical_id
+    _track_states          = {}
+    _identity_to_canonical = {}
+    _next_canonical_id     = 1
 
 #  GMC  Global Motion Compensation (ego-pose only)
 _cumulative_tx: float = 0.0
@@ -1000,7 +1006,7 @@ def run_yolo_and_track(
         for i, det in enumerate(_tmp_yolo["detections"][:n_before]):
             for flag in ("gt_sourced", "gt_type_override", "motion_source",
                           "instance_token", "gt_iou", "yolo_type_original",
-                          "speed", "speed_mps", "direction", "action"):
+                          "speed", "direction", "action"):
                 if flag in det:
                     provenance_raw[i][flag] = det[flag]
             if det.get("gt_type_override"):
@@ -1024,7 +1030,6 @@ def run_yolo_and_track(
                 "motion_source":    "nuscenes_gt",
                 "instance_token":   det.get("instance_token", ""),
                 "speed":            det.get("speed",     "unknown"),
-                "speed_mps":        det.get("speed_mps", None),
                 "direction":        det.get("direction", "stationary"),
                 "action":           det.get("action",    "unknown"),
             })
@@ -1092,7 +1097,14 @@ def run_yolo_and_track(
                     other_bboxes=[b for b in bboxes_raw if b is not bbox],
                 )
             )
-            state = _get_or_create_state(track_id, obj_type)
+
+            # Identity-first state: instance_token bridges across ByteTrack
+            # fragments; YOLO-only objects fall back to per-track-id identity.
+            it       = prov.get("instance_token", "") if prov else ""
+            identity = it if it else f"yolo_{track_id}"
+            cid      = _canonical_id_for(identity)
+
+            state = _get_or_create_state(identity, obj_type)
             state.add_observation(
                 frame_idx, bbox, pixel_color,
                 color_confidence=color_conf,
@@ -1111,7 +1123,9 @@ def run_yolo_and_track(
 
             obj_entry: Dict = {
                 "id":           i + 1,
-                "track_id":     track_id,
+                "track_id":     cid,            # primary ID surfaced to JSON / draw_tracks
+                "canonical_id": cid,
+                "bytetrack_id": track_id,       # raw tracker ID kept for debugging
                 "type":         obj_type,
                 "confidence":   round(conf, 2),
                 "position":     position,
@@ -1137,7 +1151,7 @@ def run_yolo_and_track(
                 obj_entry["gt_type_override"] = bool(prov.get("gt_type_override", False))
                 if "yolo_type_original" in prov:
                     obj_entry["yolo_type_original"] = prov["yolo_type_original"]
-                for f in ("speed", "speed_mps", "direction", "action"):
+                for f in ("speed", "direction", "action"):
                     if f in prov and prov[f] is not None:
                         obj_entry[f] = prov[f]
             if prov.get("source") == "gt_injected":
@@ -1229,9 +1243,9 @@ def draw_tracks(frame_bgr: np.ndarray, frame_data: Dict) -> np.ndarray:
 
         source = obj.get("source", "yolo")
 
-        # Prefer canonical_id (stable across track fragments via instance_token
-        # dedup, written by _assign_canonical_and_redraw). Fall back to
-        # track_id for pre-canonical renders or YOLO-only objects without one.
+        # Prefer canonical_id (allocated inline from instance_token in
+        # run_yolo_and_track, stable across ByteTrack fragments). track_id
+        # is now also the canonical id; fall back to id for legacy rows.
         cid = obj.get("canonical_id")
         if cid is None or cid == -1:
             cid = obj.get("track_id", obj.get("id", "?"))
@@ -1257,98 +1271,6 @@ def draw_tracks(frame_bgr: np.ndarray, frame_data: Dict) -> np.ndarray:
         cv2.putText(canvas, label, (x1 + 2, ly), font, 0.45,
                     color, 1, cv2.LINE_AA)
     return canvas
-
-
-def _identity_key(det: Dict) -> Optional[str]:
-    """Stable identity for a detection: instance_token if GT-confirmed,
-    else yolo_track_{track_id} for YOLO-only tracks. None when neither
-    is available (untracked transient detection)."""
-    it  = det.get("instance_token", "")
-    tid = det.get("track_id", -1)
-    if it:
-        return it
-    if isinstance(tid, int) and tid != -1:
-        return f"yolo_{tid}"
-    return None
-
-
-def _assign_canonical_and_redraw(
-    sd_records: list,
-    dataroot:   str,
-    frames_dir: str,
-    annotated_dir: str,
-    keyframes_dir: str,
-) -> None:
-    """
-    Walk per-sweep JSONs in temporal order, allocate a small-integer
-    canonical_id per (instance_token | yolo_track_id) by first appearance,
-    write canonical_id back into every detection, then redraw annotated
-    images with the canonical labels. Keyframe JSONs are also rewritten
-    so downstream Qwen / mega-summary code sees the same IDs.
-    """
-    import glob, re
-
-    frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.json")))
-    if not frame_files:
-        return
-
-    # PASS 1: identity → canonical_id by first appearance
-    identity_to_canonical: Dict[str, int] = {}
-    next_id = 1
-    for ff in frame_files:
-        with open(ff) as f:
-            data = json.load(f)
-        for det in data.get("scene_summary", {}).get("detected_objects", []):
-            key = _identity_key(det)
-            if key is None:
-                continue
-            if key not in identity_to_canonical:
-                identity_to_canonical[key] = next_id
-                next_id += 1
-
-    # PASS 2: stamp canonical_id back, redraw annotated images
-    # Build frame_idx → sd lookup so we can reload originals
-    sd_by_idx = {i: sd for i, sd in enumerate(sd_records)}
-
-    for ff in frame_files:
-        m = re.search(r"frame_(\d+)\.json", os.path.basename(ff))
-        if not m:
-            continue
-        fidx = int(m.group(1))
-
-        with open(ff) as f:
-            data = json.load(f)
-        for det in data.get("scene_summary", {}).get("detected_objects", []):
-            key = _identity_key(det)
-            det["canonical_id"] = identity_to_canonical.get(key, -1) if key else -1
-
-        with open(ff, "w") as f:
-            json.dump(data, f, indent=2)
-
-        # Redraw annotated frame with canonical labels
-        sd = sd_by_idx.get(fidx)
-        if sd is None:
-            continue
-        img_path = os.path.join(dataroot, sd["filename"])
-        frame    = cv2.imread(img_path)
-        if frame is None:
-            continue
-        canvas = draw_tracks(frame, data)
-        out_jpg = os.path.join(annotated_dir, f"frame_{fidx:06d}_track.jpg")
-        cv2.imwrite(out_jpg, canvas)
-
-    # Mirror canonical_id into keyframe JSONs (consumed by analyse_frame)
-    for kff in sorted(glob.glob(os.path.join(keyframes_dir, "keyframe_*.json"))):
-        with open(kff) as f:
-            data = json.load(f)
-        for det in data.get("scene_summary", {}).get("detected_objects", []):
-            key = _identity_key(det)
-            det["canonical_id"] = identity_to_canonical.get(key, -1) if key else -1
-        with open(kff, "w") as f:
-            json.dump(data, f, indent=2)
-
-    print(f"  ✓ {len(identity_to_canonical)} canonical IDs assigned across "
-          f"{len(frame_files)} sweep frames")
 
 
 def process_scene_sweeps(
@@ -1474,15 +1396,6 @@ def process_scene_sweeps(
     with open(os.path.join(out_dir, "keyframe_map.json"), "w") as f:
         json.dump(keyframe_map, f, indent=2)
 
-    # Canonical IDs: instance_token (or yolo_track_X) → small int, allocated by
-    # first appearance. Rewrites per-sweep + keyframe JSONs and redraws annotated
-    # images so the same physical object carries the same label across all
-    # keyframes shown to human annotators, even when ByteTrack fragments it
-    # into multiple track_ids.
-    _assign_canonical_and_redraw(
-        sd_records, dataroot, frames_dir, annotated_dir, keyframes_dir,
-    )
-
     global_summary = get_track_motion_summary(0, int(duration_secs) + 1)
     summary_path   = os.path.join(out_dir, "tracks_summary.json")
     with open(summary_path, "w") as f:
@@ -1517,7 +1430,7 @@ def get_track_motion_summary(
     start_frame = int(span_start_sec * actual_fps)
     end_frame   = int(span_end_sec   * actual_fps)
 
-    for tid, state in _track_states.items():
+    for identity, state in _track_states.items():
         active = [
             (fi, pos)
             for fi, pos in zip(state.frame_indices, state.positions)
@@ -1536,7 +1449,8 @@ def get_track_motion_summary(
             dist = math.hypot(dx, dy)
 
         summary: Dict = {
-            "track_id":         tid,
+            "identity":         identity,
+            "track_id":         _identity_to_canonical.get(identity, -1),
             "object_type":      state.obj_type,
             "speed":            state.speed_label(),
             "direction":        state.direction_label(),
