@@ -27,22 +27,40 @@ except ImportError:
 
 _clip_model       = None
 _clip_preprocess  = None
-_clip_text_emb    = None
 _clip_tokenizer   = None
 
-_COLOR_LABELS = [
-    "white vehicle",  "black vehicle",  "silver vehicle", "gray vehicle",
-    "red vehicle",    "blue vehicle",   "green vehicle",  "yellow vehicle",
-    "orange vehicle", "brown vehicle",  "beige vehicle",  "dark vehicle",
+_COLOR_NAMES = [
+    "white", "black", "silver", "gray",
+    "red", "blue", "green", "yellow",
+    "orange", "brown", "dark",
 ]
+
+# Type-specific noun used in the CLIP prompt. Lets CLIP match e.g.
+# "orange traffic cone" instead of "orange vehicle" so non-vehicle
+# objects get sensible color predictions too.
+_TYPE_NOUN = {
+    "car":           "vehicle",
+    "van":           "vehicle",
+    "truck":         "vehicle",
+    "bus":           "vehicle",
+    "motorcycle":    "vehicle",
+    "cyclist":       "bicycle",
+    "cone":          "traffic cone",
+    "barrier":       "barrier",
+    "traffic_light": "traffic light",
+}
+_DEFAULT_NOUN = "object"
+
+# Per-noun cache of normalized text embeddings, lazy-built on first use.
+_clip_text_emb_by_noun: Dict[str, object] = {}
 
 
 def _init_clip():
-    global _clip_model, _clip_preprocess, _clip_text_emb, _clip_tokenizer
+    global _clip_model, _clip_preprocess, _clip_tokenizer
     if _clip_model is not None or not CLIP_AVAILABLE:
         return
     try:
-        import open_clip, torch, warnings
+        import open_clip, warnings
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message='.*QuickGELU mismatch.*')
             _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
@@ -50,14 +68,24 @@ def _init_clip():
             )
         _clip_model.eval()
         _clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
-        with torch.no_grad():
-            tokens         = _clip_tokenizer(_COLOR_LABELS)
-            _clip_text_emb = _clip_model.encode_text(tokens)
-            _clip_text_emb = _clip_text_emb / _clip_text_emb.norm(dim=-1, keepdim=True)
         print("✓ CLIP color model loaded (ViT-B/32)")
     except Exception as e:
         print(f"⚠   CLIP init failed: {e}. Falling back to HSV.")
         _clip_model = None
+
+
+def _get_clip_text_emb_for_noun(noun: str):
+    """Lazy-build a normalized text embedding for one '{color} {noun}' set."""
+    if noun in _clip_text_emb_by_noun:
+        return _clip_text_emb_by_noun[noun]
+    import torch
+    labels = [f"{c} {noun}" for c in _COLOR_NAMES]
+    with torch.no_grad():
+        tokens = _clip_tokenizer(labels)
+        emb    = _clip_model.encode_text(tokens)
+        emb    = emb / emb.norm(dim=-1, keepdim=True)
+    _clip_text_emb_by_noun[noun] = emb
+    return emb
 
 TARGET_SCENE             = "scene-0757"   # NuScenes scene NAME (not a path) — SDK resolves frames from data/v1.0-mini/sweeps/CAM_FRONT/
 TRACKER_FRAME_RATE       = 0      # frames per second fed to tracker (0 = auto: all frames at video fps)
@@ -221,14 +249,16 @@ def extract_dominant_color_clip(frame_bgr: np.ndarray, bbox: Dict,
             from PIL import Image as _PIL_Image
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             pil_img  = _PIL_Image.fromarray(crop_rgb)
+            noun     = _TYPE_NOUN.get(obj_type, _DEFAULT_NOUN)
+            text_emb = _get_clip_text_emb_for_noun(noun)
             with torch.no_grad():
                 img_t = _clip_preprocess(pil_img).unsqueeze(0)
                 img_e = _clip_model.encode_image(img_t)
                 img_e = img_e / img_e.norm(dim=-1, keepdim=True)
-                probs = (img_e @ _clip_text_emb.T * 100).softmax(dim=-1)[0]
+                probs = (img_e @ text_emb.T * 100).softmax(dim=-1)[0]
             best_idx   = int(probs.argmax())
             confidence = float(probs[best_idx])
-            color_name = _COLOR_LABELS[best_idx].split()[0]
+            color_name = _COLOR_NAMES[best_idx]
 
             if low_light and confidence < 0.55:
                 return "dark", 0.3

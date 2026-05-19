@@ -151,6 +151,7 @@ SHEET_HEADERS = [
     "Video Review",
     "Object Count Summary",
     "Object IDs",
+    "Object Evidence Seconds",
     "Objects Detail (JSON)",
 ]
 def build_nuscenes_gt_2d(nusc, sd_records: list,
@@ -333,11 +334,13 @@ def _yolo_data_from_frame_result(frame_data: dict) -> dict:
             "direction":        d.get("direction", "unknown"),
             "action":           d.get("action",    "unknown"),
             # provenance flags — must be preserved so GT merge works correctly
-            "source":           d.get("source",           "yolo"),
-            "instance_token":   d.get("instance_token",   ""),
-            "gt_sourced":       d.get("gt_sourced",        False),
-            "gt_type_override": d.get("gt_type_override",  False),
-            "motion_source":    d.get("motion_source",     ""),
+            "source":             d.get("source",             "yolo"),
+            "instance_token":     d.get("instance_token",     ""),
+            "gt_sourced":         d.get("gt_sourced",         False),
+            "gt_type_override":   d.get("gt_type_override",   False),
+            "yolo_type_original": d.get("yolo_type_original", None),
+            "gt_iou":             d.get("gt_iou",             None),
+            "motion_source":      d.get("motion_source",      ""),
         })
     _vt = {"car", "van", "motorcycle", "bus", "truck"}
     return {
@@ -491,7 +494,12 @@ def _derive_action(obj_type: str, speed: str, direction: str) -> str:
         if "left" in direction: return "turning"
         if "right" in direction:return "turning"
         return "moving"
-    # vehicles
+    # vehicles get "parked" when stationary; other non-vehicle objects
+    # (cones, barriers, debris, "other") get "static" instead — "parked"
+    # only makes sense for vehicles.
+    is_vehicle = t in VEHICLE_CLASSES or "vehicle" in t
+    if not is_vehicle:
+        return "moving" if moving else "static"
     if not moving:              return "parked"
     if "left" in direction:     return "turning left"
     if "right" in direction:    return "turning right"
@@ -960,6 +968,11 @@ def append_row(summary: dict) -> bool:
             f"{o.get('object_type','?')}:{(o.get('tracker_id') or '').strip() or '—'}"
             for o in summary.get("raw_objects", [])
         )
+        object_evidence_seconds = "; ".join(
+            f"{o.get('object_type','?')}:{(o.get('tracker_id') or '').strip() or '—'}=["
+            f"{(o.get('evidence_seconds') or '').strip()}]"
+            for o in summary.get("raw_objects", [])
+        )
         p_info     = summary.get("participant_info", {})
         timestamp  = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         row = [
@@ -985,6 +998,7 @@ def append_row(summary: dict) -> bool:
             summary.get("video_review",       ""),
             object_summary,
             object_ids,
+            object_evidence_seconds,
             objects_detail_json,
         ]
         last_col = chr(ord("A") + len(SHEET_HEADERS) - 1)
@@ -1283,7 +1297,10 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
     # Prevents track fragmentation from inflating unique object counts:
     # the same bus getting IDs t11, t15, t21 counts as ONE vehicle, not three.
     vehicle_types = {"car", "vehicle", "truck", "bus", "motorcycle", "van", "taxi"}
-    uv, up, uc, utl = set(), set(), set(), set()
+    known_types   = vehicle_types | {"pedestrian", "cyclist", "traffic_light",
+                                     "cone", "barrier"}
+    uv, up, uc, utl, ucn, ubr, uoth = (set(), set(), set(), set(),
+                                       set(), set(), set())
 
     # Aggregate per-identity data for objects_seen list
     track_agg = {}   # identity -> {object_type, instance_token, track_ids, colors, sizes, actions, seconds, gt_sourced}
@@ -1314,10 +1331,13 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
                 continue
 
             t = obj.get("object_type", "").lower()
-            if t in vehicle_types:     uv.add(identity)
-            elif t == "pedestrian":    up.add(identity)
-            elif t == "cyclist":       uc.add(identity)
-            elif t == "traffic_light": utl.add(identity)
+            if t in vehicle_types:        uv.add(identity)
+            elif t == "pedestrian":       up.add(identity)
+            elif t == "cyclist":          uc.add(identity)
+            elif t == "traffic_light":    utl.add(identity)
+            elif t == "cone":             ucn.add(identity)
+            elif t == "barrier":          ubr.add(identity)
+            elif t not in known_types:    uoth.add(identity)
 
             if identity not in track_agg:
                 track_agg[identity] = {
@@ -1410,6 +1430,53 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
         t = o.get("object_type", "other")
         static_summary[t] = static_summary.get(t, 0) + 1
 
+    # Ego motion timeline across keyframes (from NuScenes ego_pose). Used so
+    # Qwen can mention whether the ego car stopped mid-video or moved
+    # throughout. Computed directly from _ego_poses + keyframe_map so Step 3
+    # can recompute without re-running per-keyframe analysis.
+    ego_summary = "unknown"
+    try:
+        from yolo_bytetrack import _ego_poses as _eps
+        SWEEP_FPS = 12.0
+        if _eps and os.path.exists("output/keyframe_map.json"):
+            with open("output/keyframe_map.json") as _f:
+                _km = json.load(_f)
+            timeline = []  # (sec, moving_bool)
+            for kf in _km:
+                sec  = kf.get("sample_idx")
+                fidx = kf.get("frame_idx", 0)
+                if 0 < fidx < len(_eps):
+                    p1 = _eps[fidx - 1]["translation"]
+                    p2 = _eps[fidx]["translation"]
+                    spd = math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * SWEEP_FPS
+                    timeline.append((sec, spd > 0.3))
+            timeline.sort()
+            if timeline:
+                states = [m for _, m in timeline]
+                if all(states):
+                    ego_summary = "ego vehicle was moving throughout the video"
+                elif not any(states):
+                    ego_summary = "ego vehicle remained stationary throughout the video"
+                else:
+                    segments = []
+                    cur_state = states[0]
+                    cur_start = timeline[0][0]
+                    for i in range(1, len(timeline)):
+                        if states[i] != cur_state:
+                            segments.append(
+                                (cur_start, timeline[i - 1][0], cur_state)
+                            )
+                            cur_state = states[i]
+                            cur_start = timeline[i][0]
+                    segments.append((cur_start, timeline[-1][0], cur_state))
+                    parts = [
+                        f"{'moving' if mov else 'stopped'} from s{s} to s{e}"
+                        for s, e, mov in segments
+                    ]
+                    ego_summary = "ego vehicle: " + ", then ".join(parts)
+    except Exception as _e:
+        print(f"  ⚠  ego timeline computation failed: {_e}")
+
     env_options      = " | ".join(FIELD_OPTIONS["environment"])
     lighting_options = " | ".join(FIELD_OPTIONS["lighting"])
     density_options  = " | ".join(FIELD_OPTIONS["traffic_density"])
@@ -1422,11 +1489,15 @@ Do not invent any object, motion, or event not present in the data.
 ## SCENE CONTEXT (confirmed)
 environment: {env}
 lighting: {light}
+ego_motion: {ego_summary}
 unique_object_counts:
   vehicles: {len(uv)}
   pedestrians: {len(up)}
   cyclists: {len(uc)}
   traffic_lights: {len(utl)}
+  cones: {len(ucn)}
+  barriers: {len(ubr)}
+  other: {len(uoth)}
 
 ## PER-SECOND OBJECT DATA (sampled — do not extrapolate between samples)
 Each entry contains counts and traffic_flow label for that second.
@@ -1434,7 +1505,7 @@ description field = Qwen's own description from that frame (truncated).
 {json.dumps(frame_summaries, indent=2)}
 
 ## MOVING OBJECTS — focus your narrative on these
-Each entry has: type, color, size, action, speed, direction, seen_seconds.
+Each entry has: type, color, size, action, direction, seen_seconds.
 All speed/direction values are pre-computed from LiDAR/GPS or tracker.
 Do not reinterpret them.
 {json.dumps(moving_objects, indent=2)}
@@ -1451,28 +1522,16 @@ No markdown, no explanation, no extra keys.
   "lighting": "<{lighting_options}>",
   "traffic_density": "<{density_options}>",
   "traffic_flow": "<{flow_options}>",
-  "scene_narrative": "<4 sentences synthesized from the data above. Sentence 1: environment type and overall layout. Sentence 2: each vehicle (if exists) with its color, size, and action — use exact color/size from moving_objects and static_objects data. Sentence 3:(if exists) pedestrians and cyclists with their actions. Sentence 4: (if exists) describe movements using the direction and speed attributes from moving_objects only.>",
+  "scene_narrative": "<5 sentences synthesized from the data above. Sentence 1: environment type and overall layout. Sentence 2: each vehicle (if exists) with its color, size, and action — use exact color/size from moving_objects and static_objects data. Sentence 3:(if exists) pedestrians and cyclists with their actions. Sentence 4: (if exists) describe movements using the direction from moving_objects only. Sentence 5: ego-vehicle motion using ONLY the ego_motion line above (e.g. mention if the ego car stopped mid-video or moved throughout — use the seconds given verbatim, do not invent any).>",
   "spatial_description": "<1 sentence on foreground vs background layout>",
-  "hazards_and_events": "<describe any hazard present in the per-second data, or exactly: none>",
-  "temporal_movements": [
-    {{
-      "object_type": "<type from moving_objects>",
-      "color":       "<color from moving_objects>",
-      "action":      "<action from moving_objects>",
-      "speed":       "<speed label from moving_objects>",
-      "direction":   "<direction from moving_objects>",
-      "evidence_seconds": [<seen_seconds list from moving_objects>]
-    }}
-  ],
-  "annotation_confidence": <0.9 if most objects have gt_sourced=true, else 0.7>
+  "hazards_and_events": "<describe any hazard present in the per-second data, or exactly: none>"
 }}
 
 RULES:
 1. unique_object_counts are authoritative — do not change them.
-2. temporal_movements: one entry per object in moving_objects. Empty list [] if moving_objects is empty.
-3. Every vehicle in scene_narrative must include its color and size from the data.
-4. Do not describe motion for objects in static_objects.
-5. annotation_confidence = 0.9 if NuScenes GT data was available (check if gt_sourced fields exist), else 0.7.
+2. Every vehicle in scene_narrative must include its color and size from the data.
+3. Do not describe motion for objects in static_objects.
+(temporal_movements is built deterministically by the pipeline — do not emit it.)
 """
 
     print(f"  moving_objects count : {len(moving_objects)}")
@@ -1482,25 +1541,134 @@ RULES:
     print(f"  Prompt est. tokens   : ~{int(len(prompt.split()) * 1.3)}")
     result = _call_with_retry(call_qwen_text, prompt)
     cumulative = result if isinstance(result, dict) else {}
-    cumulative["annotator_type"]      = "ai"
-    cumulative["scene_id"]            = scene_id
-    cumulative["time_span"]           = {"start_second": 0, "end_second": num_seconds - 1}
-    cumulative["total_vehicles"]      = len(uv)
-    cumulative["total_pedestrians"]   = len(up)
-    cumulative["total_cyclists"]      = len(uc)
-    cumulative["total_traffic_lights"]= len(utl)
+    cumulative["annotator_type"] = "ai"
+    cumulative["scene_id"]       = scene_id
+    cumulative["time_span"]      = {"start_second": 0, "end_second": num_seconds - 1}
+    cumulative["total_cones"]    = len(ucn)
+    cumulative["total_barriers"] = len(ubr)
+    cumulative["total_other"]    = len(uoth)
+    # Traffic-lights are not annotated in NuScenes — keep YOLO-derived count.
+    cumulative["total_traffic_lights"] = len(utl)
+
+    # Vehicles/pedestrians/cyclists: prefer NuScenes GT counts when available
+    # (hand-labeled, no YOLO false positives). Hybrid fallback per type:
+    # when GT projects zero of a type but the tracker saw some, use the
+    # tracker count — handles cases like pedestrians whose 3D boxes failed
+    # the camera-frustum projection filter in build_nuscenes_gt_2d.
+    _all_gt: dict = {}
+    counts_source_per_type: dict = {}
+    if _gt_by_frame():
+        _gt_vt = {"vehicle.car", "vehicle.truck",
+                  "vehicle.bus.rigid", "vehicle.bus.bendy",
+                  "vehicle.motorcycle", "vehicle.construction",
+                  "vehicle.trailer",
+                  "vehicle.emergency.ambulance", "vehicle.emergency.police"}
+        for fd in _gt_by_frame().values():
+            for ann in fd.get("annotations", []):
+                if ann.get("visibility", 0) >= 2:
+                    _all_gt[ann["instance_token"]] = ann["semantic_type"]
+        gt_veh = sum(1 for st in _all_gt.values() if st in _gt_vt)
+        gt_ped = sum(1 for st in _all_gt.values() if "pedestrian" in st)
+        gt_cyc = sum(1 for st in _all_gt.values() if st == "vehicle.bicycle")
+
+        def _pick(gt_n: int, tracker_n: int, label: str) -> int:
+            if gt_n > 0:
+                counts_source_per_type[label] = "nuscenes_gt"
+                return gt_n
+            counts_source_per_type[label] = "tracker_dedup"
+            return tracker_n
+
+        cumulative["total_vehicles"]    = _pick(gt_veh, len(uv), "vehicles")
+        cumulative["total_pedestrians"] = _pick(gt_ped, len(up), "pedestrians")
+        cumulative["total_cyclists"]    = _pick(gt_cyc, len(uc), "cyclists")
+        cumulative["counts_source"]     = (
+            "nuscenes_gt" if all(v == "nuscenes_gt"
+                                 for v in counts_source_per_type.values())
+            else "hybrid"
+        )
+        cumulative["counts_source_per_type"] = counts_source_per_type
+    else:
+        cumulative["total_vehicles"]    = len(uv)
+        cumulative["total_pedestrians"] = len(up)
+        cumulative["total_cyclists"]    = len(uc)
+        cumulative["counts_source"]     = "tracker_dedup"
+
+    # Fix 2 — Fragment merge: flag each objects_seen entry as gt_confirmed,
+    # then collapse non-GT fragments into their GT-confirmed counterpart when
+    # they share object_type and at least one observed second. Handles the
+    # occlusion case where ByteTrack loses a GT track and spawns a parallel
+    # non-GT track for the same physical object.
+    gt_tokens = set(_all_gt.keys())
+    for obj in objects_seen:
+        it = obj.get("instance_token") or obj.get("identity", "")
+        obj["gt_confirmed"] = bool(gt_tokens and it in gt_tokens)
+
+    if _all_gt:
+        confirmed   = [o for o in objects_seen if o.get("gt_sourced")]
+        unconfirmed = [o for o in objects_seen if not o.get("gt_sourced")]
+        merged_ids: set = set()
+
+        for uc_obj in unconfirmed:
+            uc_type    = uc_obj.get("object_type")
+            uc_seconds = set(uc_obj.get("seen_seconds", []))
+            best_match   = None
+            best_overlap = 0
+            for gt_obj in confirmed:
+                if gt_obj.get("object_type") != uc_type:
+                    continue
+                overlap = len(uc_seconds & set(gt_obj.get("seen_seconds", [])))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_match   = gt_obj
+            if best_match is not None and best_overlap > 0:
+                best_match["seen_seconds"] = sorted(
+                    set(best_match["seen_seconds"]) | uc_seconds
+                )
+                best_match["fragment_merged"]    = True
+                best_match["fragment_track_ids"] = (
+                    best_match.get("fragment_track_ids", [])
+                    + uc_obj.get("track_ids", [])
+                )
+                merged_ids.add(uc_obj["identity"])
+
+        objects_seen = [o for o in objects_seen
+                        if o["identity"] not in merged_ids]
+        if merged_ids:
+            print(f"  Fragment merge: {len(merged_ids)} unconfirmed tracks "
+                  f"merged into GT entries")
+
     cumulative["objects_seen"]        = objects_seen
-    if not cumulative.get("temporal_movements") and movements:
-        cumulative["temporal_movements"] = [
-            {
-                "object_type":      m.get("object_type", "unknown"),
-                "color":            m.get("color", "unknown"),
-                "movement":         f"{m.get('direction','unknown')} at {m.get('speed','unknown')}",
-                "distance_px":      m.get("distance_px", 0.0),
-                "evidence_seconds": m.get("evidence_seconds", []),
-            }
-            for m in movements
-        ]
+
+    # temporal_movements is built deterministically from moving_objects (real
+    # tracker identity + aggregates) and the tracker's movements list (real
+    # direction + speed labels). Qwen is no longer asked for this — every
+    # field is grounded in tracker data, so IDs and motion are guaranteed
+    # correct.
+    movements_by_identity = {m.get("identity"): m for m in (movements or [])}
+    movements_by_track_id = {m.get("track_id"): m for m in (movements or [])}
+    cumulative["temporal_movements"] = []
+    for mo in moving_objects:
+        ident = mo.get("identity")
+        tids  = mo.get("track_ids", []) or []
+        # Look up direction/speed by identity first, then any matching track_id.
+        mv = movements_by_identity.get(ident)
+        if mv is None:
+            for t in tids:
+                if t in movements_by_track_id:
+                    mv = movements_by_track_id[t]
+                    break
+        cumulative["temporal_movements"].append({
+            "identity":         ident,
+            "track_ids":        tids,
+            "object_type":      mo.get("object_type", "unknown"),
+            "color":            mo.get("color", "unknown"),
+            "size":             mo.get("size",  "unknown"),
+            "action":           mo.get("action", "unknown"),
+            "direction":        (mv or {}).get("direction", "unknown"),
+            "speed":            (mv or {}).get("speed",     "unknown"),
+            "evidence_seconds": mo.get("seen_seconds", []),
+            "gt_sourced":       mo.get("gt_sourced", False),
+        })
 
     #  NuScenes GT validation
     if _gt_by_frame():

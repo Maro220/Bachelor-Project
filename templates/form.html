@@ -809,6 +809,10 @@ const INSTANCE_FIELDS = {
             placeholder: 'e.g. 45'
         },
         {
+            id: 'evidence_seconds', label: 'Seconds seen', type: 'text', required: false,
+            placeholder: 'e.g. 5,6,7'
+        },
+        {
             id: 'position', label: 'Position in frame', type: 'select', required: true,
             options: ['Foreground Left','Foreground Center','Foreground Right',
                       'Midground Left','Midground Center','Midground Right',
@@ -816,11 +820,16 @@ const INSTANCE_FIELDS = {
         },
         {
             id: 'action', label: 'Action / behavior', type: 'select', required: false,
-            options: ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'],
-            // pedestrians can't be "parked" — give them walking-centric verbs instead
-            optionsFor: t => t === 'pedestrian'
-                ? ['walking','stopped','crossing','static','unknown']
-                : ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'],
+            options: ['moving','stopped','turning left','turning right','crossing','static','unknown'],
+            // Only vehicles can be "parked"; pedestrians use walking-centric
+            // verbs; cyclists/other movable objects use the generic list.
+            optionsFor: t => {
+                if (t === 'pedestrian')
+                    return ['walking','stopped','crossing','static','unknown'];
+                if (['car','van','truck','bus','motorcycle'].includes(t))
+                    return ['moving','parked','stopped','turning left','turning right','crossing','static','unknown'];
+                return ['moving','stopped','turning left','turning right','crossing','static','unknown'];
+            },
             condition: t => !['traffic_light','cone','barrier','other'].includes(t)
         },
     ],
@@ -829,7 +838,7 @@ const INSTANCE_FIELDS = {
         fields: [
             {
                 id: 'color', label: 'Vehicle color', type: 'select', required: true,
-                options: ['white','black','silver','gray','red','blue','green','yellow','orange','brown','beige','mixed / two-tone']
+                options: ['white','black','silver','gray','red','blue','green','yellow','orange','brown','mixed / two-tone']
             },
             {
                 id: 'size', label: 'Apparent size in frame', type: 'select', required: true,
@@ -842,10 +851,6 @@ const INSTANCE_FIELDS = {
             {
                 id: 'direction', label: 'Direction of travel', type: 'select', required: false,
                 options: ['towards camera','away from camera','left to right','right to left','stationary','unclear']
-            },
-            {
-                id: 'lane_position', label: 'Lane / road position', type: 'select', required: false,
-                options: ['left lane','center lane','right lane','parking bay','unclear']
             },
             {
                 id: 'extra', label: 'Additional details', type: 'text', required: false,
@@ -876,16 +881,12 @@ const INSTANCE_FIELDS = {
         applies: t => t === 'cyclist',
         fields: [
             {
-                id: 'lane_use', label: 'Using cycle lane?', type: 'select', required: false,
-                options: ['yes — in cycle lane','no — in traffic lane','pavement (illegal)','no cycle lane present','unclear']
-            },
-            {
                 id: 'direction', label: 'Direction of travel', type: 'select', required: false,
                 options: ['towards camera','away from camera','left to right','right to left','stationary']
             },
             {
                 id: 'extra', label: 'Additional details', type: 'text', required: false,
-                placeholder: 'e.g. cargo bike, e-bike, visibility vest...',
+                placeholder: '',
                 fullWidth: true
             },
         ]
@@ -895,17 +896,21 @@ const INSTANCE_FIELDS = {
         fields: [
             {
                 id: 'signal_state', label: 'Signal state showing', type: 'select', required: true,
-                options: ['green','yellow / amber','red','off / dark','unclear']
+                options: ['green','yellow ','red','off','unclear']
             },
             {
                 id: 'visibility', label: 'Signal visibility', type: 'select', required: false,
                 options: ['fully visible','partially occluded','sun glare on lens','obscured','unclear']
             },
+        ]
+    },
+    _cone_barrier: {
+        applies: t => t === 'cone' || t === 'barrier',
+        fields: [
             {
-                id: 'compliance', label: 'Are road users complying?', type: 'select', required: false,
-                options: ['yes — all stopped at red','yes — all moving on green',
-                          'no — vehicle running red','no — pedestrian crossing on red',
-                          'mixed','not applicable / cannot tell']
+                id: 'extra', label: 'Additional details', type: 'text', required: false,
+                placeholder: 'e.g. color, size, position..',
+                fullWidth: true
             },
         ]
     },
@@ -991,6 +996,7 @@ function goToPage3() {
         if (!obj.position) missingReq++;
         if (['car','van','truck','bus','motorcycle'].includes(obj.object_type) && (!obj.color || !obj.size)) missingReq++;
         if (obj.object_type === 'traffic_light' && !obj.signal_state) missingReq++;
+        if (['cone','barrier','other'].includes(obj.object_type) && !obj.description) missingReq++;
     });
     if (missingReq > 0) { show2(`Please complete all required fields in the objects section (${missingReq} missing).`); return; }
 
