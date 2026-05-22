@@ -493,7 +493,28 @@
             </div>
             <div class="field">
                 <label for="p_country">Country of residence <span class="req">*</span></label>
-                <input type="text" id="p_country" required placeholder="e.g. Denmark">
+                <select id="p_country" required>
+                    <option value="">— select country —</option>
+                    <option>Afghanistan</option>
+                    <option>Albania</option>
+                    <option>Algeria</option>
+                    <option>Andorra</option>
+                    <option>Angola</option>
+                    <option>Argentina</option>
+                    <option>Australia</option>
+                    <option>Austria</option>
+                    <option>Egypt</option>
+                    <option>France</option>
+                    <option>Germany</option>
+                    <option>India</option>
+                    <option>Italy</option>
+                    <option>Japan</option>
+                    <option>Saudi Arabia</option>
+                    <option>Spain</option>
+                    <option>United Arab Emirates</option>
+                    <option>United Kingdom</option>
+                    <option>United States</option>
+                </select>
             </div>
             <div class="field">
                 <label for="p_age">Age category <span class="req">*</span></label>
@@ -559,10 +580,10 @@
     </div><!-- end page 1 -->
 
     <!-- ════════════════════════════════════════════
-         PAGE 2 — Annotation Form
+         PAGE 2 — Video-specific observations
     ════════════════════════════════════════════ -->
     <div class="page-slide">
-    <div class="body" id="mainBody">
+    <div class="body">
 
         <!-- Step indicator (page 2 view) -->
         <div class="step-indicator" style="margin-bottom:20px">
@@ -571,6 +592,52 @@
             <div class="step-dot active"></div>
             <div class="step-line"></div>
             <div class="step-dot"></div>
+        </div>
+
+        <div class="sec-label">Video-specific observations</div>
+        <p style="font-size:12px;color:var(--ink3);margin-bottom:14px">Watch the full video below, then continue to the annotation form.</p>
+
+        <div id="sectionVideoContainer"></div>
+
+        <div class="field">
+            <label for="f_video_review">Initial video description <span class="req">*</span>
+                <span class="hint">objects, movements, environment, etc.</span>
+            </label>
+            <!-- VOICE: video review -->
+            <div class="voice-row">
+                <textarea id="f_video_review" rows="5" required placeholder="Annotate your initial observations about this video"></textarea>
+                <button type="button" class="btn-mic" id="mic_f_video_review"
+                    onclick="toggleVoice('f_video_review')" title="Click to record, click again to stop">🎤</button>
+            </div>
+            <div class="voice-hint">🎤 Click the mic to dictate</div>
+        </div>
+
+        <hr class="divider">
+
+        <div class="btn-row">
+            <button class="btn-back" onclick="goToPage1()">← Back</button>
+            <button class="btn btn-primary" onclick="goToPage3()">
+                Next → Annotation form
+            </button>
+        </div>
+        <div class="status" id="statusPage2"></div>
+
+    </div>
+    </div><!-- end page 2 -->
+
+    <!-- ════════════════════════════════════════════
+         PAGE 3 — Annotation Form
+    ════════════════════════════════════════════ -->
+    <div class="page-slide">
+    <div class="body" id="mainBody">
+
+        <!-- Step indicator (page 3 view) -->
+        <div class="step-indicator" style="margin-bottom:20px">
+            <div class="step-dot active"></div>
+            <div class="step-line done-line"></div>
+            <div class="step-dot active"></div>
+            <div class="step-line done-line"></div>
+            <div class="step-dot active"></div>
         </div>
 
         <div id="imgContainer"></div>
@@ -595,10 +662,8 @@
                 <label for="f_lighting">Lighting <span class="req">*</span></label>
                 <select id="f_lighting" required onchange="renderConditionalQuestions()">
                     <option value="">— select —</option>
-                    <option>bright daylight</option>
-                    <option>low-light</option>
-                    <option>night with street lights</option>
-                    <option>night without lighting</option>
+                    <option>day</option>
+                    <option>night</option>
                 </select>
             </div>
             <div class="field">
@@ -628,9 +693,9 @@
         <hr class="divider">
 
         <!-- ── Narrative ── -->
-        <div class="sec-label">Scene description (narrative)</div>
+        <div class="sec-label"> Detailed scene description (narrative)</div>
         <div class="instruction-box">
-            <strong>Minimum 40 words required.</strong> Describe the image/video as thoroughly as possible. Cover all five points:
+            <strong>Minimum 40 words required.</strong>Now, describe the frames as thoroughly as possible. Cover all five points:
             <ol>
                 <li><strong>Scene type</strong> — what kind of place is this?</li>
                 <li><strong>All visible objects</strong> — include type, color, size, and position for each</li>
@@ -641,7 +706,7 @@
         </div>
         <div class="field">
             <label for="narrative">Your detailed description <span class="req">*</span>
-                <span class="hint">Be as specific as a police report — colors, sizes, positions, actions</span>
+                <span class="hint">Be as specific  — colors, sizes, positions, actions</span>
             </label>
             <!-- VOICE: narrative -->
             <div class="voice-row">
@@ -710,60 +775,14 @@
 
         <hr class="divider">
 
-        <!-- ── Next ── -->
-        <div class="btn-row">
-            <button class="btn-back" onclick="goToPage1()">← Back</button>
-            <button class="btn btn-primary" id="nextToVideoBtn" onclick="goToPage3()">
-                Next → Video observations
-            </button>
-        </div>
-        <div class="status" id="statusPage2"></div>
-
-    </div>
-    </div><!-- end page 2 -->
-
-    <!-- ════════════════════════════════════════════
-         PAGE 3 — Video-specific observations
-    ════════════════════════════════════════════ -->
-    <div class="page-slide">
-    <div class="body">
-
-        <!-- Step indicator (page 3 view) -->
-        <div class="step-indicator" style="margin-bottom:20px">
-            <div class="step-dot active"></div>
-            <div class="step-line done-line"></div>
-            <div class="step-dot active"></div>
-            <div class="step-line done-line"></div>
-            <div class="step-dot active"></div>
-        </div>
-
-        <div class="sec-label">Video-specific observations</div>
-        <p style="font-size:12px;color:var(--ink3);margin-bottom:14px">Watch the full video below, then review your annotations.</p>
-
-        <div id="sectionVideoContainer"></div>
-
-        <div class="field">
-            <label for="f_video_review">Now after watching it as a video, do you need to add/change any of your annotations?
-                <span class="hint">any change in objects? movements? environment? etc.</span>
-            </label>
-            <!-- VOICE: video review -->
-            <div class="voice-row">
-                <textarea id="f_video_review" rows="5" placeholder="Note any additions, corrections, or new observations from watching the full video — or leave blank if nothing changes."></textarea>
-                <button type="button" class="btn-mic" id="mic_f_video_review"
-                    onclick="toggleVoice('f_video_review')" title="Click to record, click again to stop">🎤</button>
-            </div>
-            <div class="voice-hint">🎤 Click the mic to dictate</div>
-        </div>
-
-        <hr class="divider">
-
+        <!-- ── Submit ── -->
         <div class="btn-row">
             <button class="btn-back" onclick="backToPage2()">← Back</button>
-            <button class="btn btn-primary" id="submitBtn" onclick="submitForm()">
+            <button class="btn btn-primary" id="submitBtn" onclick="validateAndSubmit()">
                 Submit annotation
             </button>
         </div>
-
+        <div class="status" id="statusPage3"></div>
         <div class="status" id="status"></div>
 
         <!-- ── Done ── -->
@@ -966,12 +985,26 @@ function backToPage2() {
 }
 
 function goToPage3() {
+    const review = document.getElementById('f_video_review').value.trim();
+    const status = document.getElementById('statusPage2');
+    if (!review) {
+        status.textContent = 'Please add your initial notes after watching the video.';
+        status.className = 'status warn';
+        return;
+    }
+    status.textContent = '';
+    status.className = 'status';
+    document.getElementById('pagesTrack').style.transform = 'translateX(-200%)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function validateAndSubmit() {
     const narrative  = document.getElementById('narrative').value.trim();
     const wordCount  = narrative ? narrative.trim().split(/\s+/).length : 0;
     const env        = document.getElementById('f_environment').value;
     const lighting   = document.getElementById('f_lighting').value;
     const hazardsYN  = document.getElementById('f_hazards_yn').value;
-    const show2 = msg => { document.getElementById('statusPage2').textContent = msg; document.getElementById('statusPage2').className = 'status warn'; };
+    const show2 = msg => { document.getElementById('statusPage3').textContent = msg; document.getElementById('statusPage3').className = 'status warn'; };
 
     if (wordCount < 40)  { show2(`Please write at least 40 words in your description (currently ${wordCount}).`); return; }
     const sentenceCount = (narrative.match(/[.!?]+(\s|$)/g) || []).length;
@@ -986,7 +1019,7 @@ function goToPage3() {
         show2('Please describe the hazards.'); return;
     }
     const objects = collectObjects();
-    if (objects.length < 3) { show2('Please provide details for at least 3 objects.'); return; }
+    if (objects.length < 1) { show2('Please provide details for at least 1 object.'); return; }
     let missingReq = 0;
     objects.forEach(obj => {
         // Only the first 2 instances of each object card are mandatory.
@@ -1000,9 +1033,9 @@ function goToPage3() {
     });
     if (missingReq > 0) { show2(`Please complete all required fields in the objects section (${missingReq} missing).`); return; }
 
-    document.getElementById('statusPage2').className = 'status';
-    document.getElementById('pagesTrack').style.transform = 'translateX(-200%)';
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    document.getElementById('statusPage3').className = 'status';
+    document.getElementById('statusPage3').textContent = '';
+    submitForm();
 }
 
 function selectSkill(btn) {
@@ -1325,7 +1358,7 @@ function updateInstanceFields(objId) {
 }
 
 function validateObjectCount() {
-    // validation handled in goToPage3()
+    // validation handled in validateAndSubmit()
 }
 
 // Initialize with 2 default object cards

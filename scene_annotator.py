@@ -13,6 +13,15 @@ from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 load_dotenv()
+
+# ── Simple pipeline imports ──────────────────────────────────────────────────
+try:
+    from top3_pipeline import run_top3_phase
+    TOP3_PIPELINE_AVAILABLE = True
+except ImportError as _e:
+    print(f"top3_pipeline not found: {_e}")
+    TOP3_PIPELINE_AVAILABLE = False
+    run_top3_phase = None
 import cv2
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
@@ -27,8 +36,9 @@ try:
         TARGET_SCENE,
         set_nuscenes_gt,
         reset_gt_state,
-        _NUSCENES_TO_YOLO_TYPE,
         _bbox_iou,
+        _derive_action,
+        build_nuscenes_gt_2d,
     )
     TRACKER_AVAILABLE = True
 except Exception as e:
@@ -44,8 +54,9 @@ except Exception as e:
     merge_gt_into_detections = None
     set_nuscenes_gt = None
     reset_gt_state = None
-    _NUSCENES_TO_YOLO_TYPE = {}
     _bbox_iou = lambda a, b: 0.0
+    _derive_action = None
+    build_nuscenes_gt_2d = None
 
 
 def _gt_by_frame() -> dict:
@@ -78,12 +89,17 @@ TOKEN_FILE       = "token.json"
 SHEET_ID_FILE    = "spreadsheet_id.txt"
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVER_PORT      = 7860
-DEFAULT_SCENE    = "scene-0757" 
-DEFAULT_TARGET   = f"output_nuscenes/{DEFAULT_SCENE}/{DEFAULT_SCENE}_CAM_FRONT.mp4" 
+DEFAULT_SCENE    = "scene-0103" 
+DEFAULT_TARGET   = f"output_nuscenes/{DEFAULT_SCENE}/{DEFAULT_SCENE}_CAM_FRONT.mp4"
+
+# Active scene output root — set at runtime by process_scene() or serve_form.py.
+# All Flask routes read from this so the server always points at the right scene.
+_SCENE_OUT_DIR    = "output/scene-0757"   # safe default, overwritten at runtime
+_ACTIVE_SCENE_NAME = "scene-0757"         # safe default, overwritten at runtime
 
 FIELD_OPTIONS = {
     "environment":    ["urban street", "highway", "parking lot", "intersection", "residential area", "school zone", "construction zone"],
-    "lighting":       ["bright daylight", "low-light", "night with street lights", "night without lighting"],
+    "lighting":       ["day", "night"],
     "traffic_density":["empty", "light", "moderate", "heavy", "gridlock"],
     "traffic_flow":   ["free-flowing", "slow-moving", "stopped", "mixed"],
 }
@@ -92,16 +108,11 @@ VEHICLE_CLASSES       = {"car", "van", "motorcycle", "bus", "truck"}
 
 
 def _infer_scene_fields_from_nuscenes(description: str) -> dict:
-    """
-    Map a NuScenes scene description (e.g. 'Parked truck, construction,
-    intersection, turn left') to:
-      - environment      : a single locked value from FIELD_OPTIONS["environment"]
-      - lighting_options : the 2-option subset (day or night) Qwen may pick from
-      - lighting_default : fallback if Qwen's value is outside the subset
-      - is_night         : bool — for the prompt context line
-    Environment is hard-locked. Lighting is constrained to a day/night subset;
-    Qwen still chooses bright-vs-low-light or street-lights-vs-none from what it sees.
-    """
+    
+    #Map a NuScenes scene description (e.g. 'Parked truck, construction,
+   # intersection, turn left') to environment + lighting. Both are locked from
+   # the NuScenes description; Qwen no longer chooses either.
+   
     desc = (description or "").lower()
 
     # Environment keyword priority order matters: 'construction' beats 'intersection'
@@ -114,19 +125,11 @@ def _infer_scene_fields_from_nuscenes(description: str) -> dict:
     elif "intersection" in desc: env = "intersection"
     else:                        env = "urban street"
 
-    is_night = any(kw in desc for kw in ("night", "dusk", "dawn"))
-    if is_night:
-        lighting_options = ["night with street lights", "night without lighting"]
-        lighting_default = "night with street lights"
-    else:
-        lighting_options = ["bright daylight", "low-light"]
-        lighting_default = "bright daylight"
+    lighting = "night" if any(kw in desc for kw in ("night", "dusk", "dawn")) else "day"
 
     return {
-        "environment":      env,
-        "lighting_options": lighting_options,
-        "lighting_default": lighting_default,
-        "is_night":         is_night,
+        "environment": env,
+        "lighting":    lighting,
     }
 SHEET_HEADERS = [
     "Timestamp",
@@ -154,167 +157,10 @@ SHEET_HEADERS = [
     "Object Evidence Seconds",
     "Objects Detail (JSON)",
 ]
-def build_nuscenes_gt_2d(nusc, sd_records: list,
-                          image_size=(1600, 900)) -> dict:
-    """
-    Project NuScenes 3D sample annotations into 2D bboxes for every sweep
-    frame (~12 Hz), not just keyframes. 3D boxes are world-frame and valid at
-    any timestamp, so each sweep's own ego_pose gives an accurate 2D bbox.
-    Motion attributes (speed_label) come from nusc.box_velocity()
-    on the keyframe annotation; direction is computed per-instance from
-    sweep-to-sweep pixel displacement.
-
-    Output shape matches what set_nuscenes_gt() expects:
-      { "frames": [ { "frame_video_idx": <frame_idx>,
-                      "annotations": [ {instance_token, semantic_type,
-                                        visibility, bbox_2d, speed_label,
-                                        direction, action }, ... ]
-                    } ] }
-    """
-    from nuscenes.utils.geometry_utils import view_points
-    from nuscenes.utils.data_classes import Box as _NuscBox
-    from pyquaternion import Quaternion
-    import numpy as _np
-    import math as _math
-
-    W, H = image_size
-
-    calib = nusc.get("calibrated_sensor", sd_records[0]["calibrated_sensor_token"])
-    K     = _np.array(calib["camera_intrinsic"])
-
-    def _speed_label(v_mps: float) -> str:
-        if v_mps < 0.5: return "stationary"
-        if v_mps < 2.0: return "slow"
-        if v_mps < 8.0: return "moving"
-        return "fast"
-
-    def _direction(dx: float, dy: float, speed_label: str) -> str:
-        if speed_label == "stationary" or (abs(dx) < 1.0 and abs(dy) < 1.0):
-            return "stationary"
-        # Image y grows downward; flip so +y = up for human-readable labels
-        angle = _math.degrees(_math.atan2(-dy, dx))
-        if   -45 <= angle <  45: return "moving right"
-        elif  45 <= angle < 135: return "moving up"
-        elif -135 <= angle < -45:return "moving down"
-        else:                    return "moving left"
-
-    # Build keyframe annotation cache (raw 3D world-frame, indexed by sample_token).
-    # Sweeps inherit annotations from the most recent keyframe in the chain.
-    sample_annotations: dict = {}
-    for sd in sd_records:
-        if not sd["is_key_frame"]:
-            continue
-        sample = nusc.get("sample", sd["sample_token"])
-        anns = []
-        for ann_token in sample["anns"]:
-            ann = nusc.get("sample_annotation", ann_token)
-            cat = nusc.get("category",
-                           nusc.get("instance", ann["instance_token"])["category_token"])
-            if cat["name"] not in _NUSCENES_TO_YOLO_TYPE:
-                continue
-            try:
-                vis_lvl = int(nusc.get("visibility", ann.get("visibility_token", ""))["token"])
-            except (KeyError, ValueError):
-                vis_lvl = 0
-            try:
-                v_world   = nusc.box_velocity(ann_token)
-                speed_mps = float(_np.linalg.norm(v_world[:2]))
-                if _np.isnan(speed_mps):
-                    speed_mps = 0.0
-            except Exception:
-                speed_mps = 0.0
-            anns.append({
-                "instance_token": ann["instance_token"],
-                "semantic_type":  cat["name"],
-                "translation":    ann["translation"],
-                "size":           ann["size"],
-                "rotation":       ann["rotation"],
-                "visibility":     vis_lvl,
-                "speed_label":    _speed_label(speed_mps),
-            })
-        sample_annotations[sd["sample_token"]] = anns
-
-    def _project_box(ann_3d, ego_pose):
-        box = _NuscBox(ann_3d["translation"], ann_3d["size"],
-                       Quaternion(ann_3d["rotation"]))
-        box.translate(-_np.array(ego_pose["translation"]))
-        box.rotate(Quaternion(ego_pose["rotation"]).inverse)
-        box.translate(-_np.array(calib["translation"]))
-        box.rotate(Quaternion(calib["rotation"]).inverse)
-        corners_3d = box.corners()
-        # Reject if ANY corner is at or behind the camera plane. Partial
-        # behind-camera boxes blow up under perspective divide and clamp
-        # to a full-frame bbox; the object reappears cleanly on the next
-        # sweep once all 8 corners are in front.
-        if (corners_3d[2, :] <= 0.1).any():
-            return None
-        corners_2d = view_points(corners_3d, K, normalize=True)[:2]
-        x1_raw, y1_raw = float(corners_2d[0].min()), float(corners_2d[1].min())
-        x2_raw, y2_raw = float(corners_2d[0].max()), float(corners_2d[1].max())
-        # If the raw projection is fully outside the image, skip — clamping
-        # would otherwise glue it to the frame edge as a thin strip.
-        if x2_raw < 0 or y2_raw < 0 or x1_raw >= W or y1_raw >= H:
-            return None
-        x1 = max(0,   int(x1_raw))
-        y1 = max(0,   int(y1_raw))
-        x2 = min(W-1, int(x2_raw))
-        y2 = min(H-1, int(y2_raw))
-        if x2 - x1 < 4 or y2 - y1 < 4:
-            return None
-        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0}
-
-    frames_out      = []
-    last_kf_anns    = []
-    prev_centers: dict = {}  # instance_token -> (cx, cy) from previous sweep
-
-    for frame_idx, sd in enumerate(sd_records):
-        ego_pose = nusc.get("ego_pose", sd["ego_pose_token"])
-        if sd["is_key_frame"]:
-            last_kf_anns = sample_annotations.get(sd["sample_token"], [])
-
-        anns_out = []
-        for ann_3d in last_kf_anns:
-            proj = _project_box(ann_3d, ego_pose)
-            if proj is None:
-                continue
-            it     = ann_3d["instance_token"]
-            cx, cy = proj["cx"], proj["cy"]
-
-            direction = "stationary"
-            if ann_3d["speed_label"] != "stationary" and it in prev_centers:
-                pcx, pcy = prev_centers[it]
-                direction = _direction(cx - pcx, cy - pcy, ann_3d["speed_label"])
-            prev_centers[it] = (cx, cy)
-
-            action = _derive_action(ann_3d["semantic_type"],
-                                    ann_3d["speed_label"], direction)
-
-            anns_out.append({
-                "instance_token": it,
-                "semantic_type":  ann_3d["semantic_type"],
-                "visibility":     ann_3d["visibility"],
-                "bbox_2d":        {"x1": proj["x1"], "y1": proj["y1"],
-                                   "x2": proj["x2"], "y2": proj["y2"]},
-                "speed_label":    ann_3d["speed_label"],
-                "direction":      direction,
-                "action":         action,
-            })
-
-        frames_out.append({
-            "frame_video_idx": frame_idx,
-            "annotations":     anns_out,
-        })
-
-    n_kf = sum(1 for sd in sd_records if sd["is_key_frame"])
-    print(f"✓ GT projected at all {len(frames_out)} sweep frames ({n_kf} keyframes)")
-    return {"frames": frames_out}
-
-
 def _yolo_data_from_frame_result(frame_data: dict) -> dict:
-    """Convert yolo_bytetrack frame output to the yolo_data format expected by analyse_frame.
-    Preserves all provenance flags (gt_sourced, instance_token, source, gt_type_override)
-    so merge_gt_into_detections and the strict motion policy work correctly downstream."""
+   # Convert yolo_bytetrack frame output to the yolo_data format expected by analyse_frame.
+   # Preserves all provenance flags (gt_sourced, instance_token, source, gt_type_override)
+    #so merge_gt_into_detections and the strict motion policy work correctly downstream
     ss   = frame_data.get("scene_summary", {})
     dets = ss.get("detected_objects", [])
     detections = []
@@ -476,36 +322,6 @@ def _derive_traffic_density(n_vehicles: int, n_cyclists: int) -> str:
     return "gridlock"
 
 
-def _derive_action(obj_type: str, speed: str, direction: str) -> str:
-    """Map tracker speed/direction (GMC-corrected) to a human-readable action label.
-    Called instead of asking Qwen, which only sees a single static frame and cannot
-    judge motion reliably."""
-    t = obj_type.lower()
-    moving = speed not in ("stationary", "unknown")
-
-    if "traffic light" in t or (t == "light"):
-        return "static"
-    if any(x in t for x in ["person", "pedestrian"]):
-        if not moving:          return "standing"
-        if speed == "slow":     return "walking"
-        return "running"
-    if any(x in t for x in ["cyclist", "bicycle"]):
-        if not moving:          return "stopped"
-        if "left" in direction: return "turning"
-        if "right" in direction:return "turning"
-        return "moving"
-    # vehicles get "parked" when stationary; other non-vehicle objects
-    # (cones, barriers, debris, "other") get "static" instead — "parked"
-    # only makes sense for vehicles.
-    is_vehicle = t in VEHICLE_CLASSES or "vehicle" in t
-    if not is_vehicle:
-        return "moving" if moving else "static"
-    if not moving:              return "parked"
-    if "left" in direction:     return "turning left"
-    if "right" in direction:    return "turning right"
-    return "moving"
-
-
 def validate_qwen_against_gt(scene_summary: dict, gt_annotations: list) -> dict:
     """Score Qwen's scene_summary against NuScenes ground truth."""
     scores = {}
@@ -592,8 +408,9 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
                 "detections": [],
             }
 
-    os.makedirs("output/yolo_raw", exist_ok=True)
-    with open(f"output/yolo_raw/yolo_raw_{scene_id}.json", "w") as f:
+    yolo_raw_dir = os.path.join(_SCENE_OUT_DIR, "full", "yolo_raw")
+    os.makedirs(yolo_raw_dir, exist_ok=True)
+    with open(os.path.join(yolo_raw_dir, f"yolo_raw_{scene_id}.json"), "w") as f:
         json.dump(yolo_data, f, indent=2)
 
     cv2.imwrite(out_img_path, frame)
@@ -681,24 +498,14 @@ def analyse_frame(frame, scene_id, out_json_path, out_img_path, yolo_data=None, 
     env_options      = " | ".join(FIELD_OPTIONS["environment"])
     flow_options     = " | ".join(FIELD_OPTIONS["traffic_flow"])
 
-    # Lighting choices: if NuScenes told us it's a night scene, restrict Qwen
-    # to the night subset; otherwise the day subset. Qwen still refines within.
-    if stable_fields and stable_fields.get("lighting_options"):
-        lighting_options = " | ".join(stable_fields["lighting_options"])
-    else:
-        lighting_options = " | ".join(FIELD_OPTIONS["lighting"])
-
     stable_context = ""
     if stable_fields:
         env_locked = stable_fields.get("environment", "")
-        is_night   = stable_fields.get("is_night", False)
         nusc_desc  = stable_fields.get("nuscenes_description", "")
         stable_context = (
             f"## SCENE METADATA (from NuScenes — authoritative)\n"
             f"nuscenes_description: {nusc_desc!r}\n"
-            f"environment: {env_locked}  (FIXED — output this value verbatim)\n"
-            f"time_of_day: {'night' if is_night else 'day'}  "
-            f"(lighting must be one of: {lighting_options})\n\n"
+            f"environment: {env_locked}  (FIXED — output this value verbatim)\n\n"
         )
 
     prompt = f"""You are annotating a traffic scene image, taking in considertion that it involves the ego vehicle.
@@ -729,7 +536,6 @@ No markdown, no explanation, no extra keys.
   "scene_summary": {{
     "scene_description": "<3-4 sentences synthesized strictly from the object attributes above. Sentence 1: environment type and overall layout. Sentence 2: list each vehicle with its color, size, position, and action. Sentence 3: pedestrians and cyclists with their action and position. Sentence 4: traffic flow summary and any interactions between objects.>",
     "environment": "<{env_options}>",
-    "lighting": "<{lighting_options}>",
     "traffic_flow": "<{flow_options}>",
     "spatial_description": "<1 sentence: what is in the foreground vs background>",
     "hazards_and_events": "<describe any hazard clearly visible in image, or exactly: none>"
@@ -742,12 +548,9 @@ RULES:
 3. speed/direction/action values come from the data above — do not guess from pixels.
 4. If color=unknown, write 'unknown-colored' — do not guess the color.
 5. If gt_confirmed contains objects not in detected_objects, include them.
-6. environment and lighting: if stable_context is set, keep those values unless image clearly contradicts.
+6. environment: if stable_context is set, output that value verbatim.
 """
-
     print(f"  > Qwen analysing frame '{scene_id}'")
-    print(f"    Prompt chars       : {len(prompt)}")
-    print(f"    Prompt est. tokens : ~{int(len(prompt.split()) * 1.3)}")
     try:
         result = _call_with_retry(call_qwen_vision, frame, prompt)
     except Exception as e:
@@ -765,13 +568,10 @@ RULES:
     ss["total_barriers_detected"]       = n_br
     ss["total_other_detected"]          = n_oth
     ss["traffic_density"]               = _derive_traffic_density(n_veh, n_cyc)
-    # Lock environment from NuScenes; validate lighting against the day/night
-    # subset (if Qwen returned something outside it, fall back to default).
+    # Lock environment and lighting from NuScenes — Qwen no longer chooses either.
     if stable_fields:
         ss["environment"] = stable_fields.get("environment", ss.get("environment", ""))
-        valid_lighting    = stable_fields.get("lighting_options") or FIELD_OPTIONS["lighting"]
-        if ss.get("lighting") not in valid_lighting:
-            ss["lighting"] = stable_fields.get("lighting_default", valid_lighting[0])
+        ss["lighting"]    = stable_fields.get("lighting",    ss.get("lighting",    ""))
 
     if _gt_by_frame() and frame_idx is not None:
         frame_gt_all  = _gt_by_frame().get(frame_idx, {})
@@ -1031,9 +831,12 @@ _whisper_model = whisper.load_model("base")
 
 flask_app = Flask(__name__)
 def _find_image(scene_id):
-    for c in [f"output/scene/frame_{scene_id}.jpg",
-              f"output/scene/frame_sec_{scene_id}.jpg",
-              "output/scene/frame_static.jpg"]:
+    base = _SCENE_OUT_DIR
+    for c in [
+        f"{base}/full/scene/frame_{scene_id}.jpg",
+        f"{base}/full/scene/frame_sec_{scene_id}.jpg",
+        f"{base}/full/scene/frame_static.jpg",
+    ]:
         if os.path.exists(c):
             return c
     return None
@@ -1047,45 +850,44 @@ def api_scene_image():
     return jsonify({"b64": _img_to_b64(path) if path else None})
 @flask_app.route("/api/scene-video")
 def api_scene_video():
-    target = DEFAULT_TARGET
+    target = f"output_nuscenes/{_ACTIVE_SCENE_NAME}/{_ACTIVE_SCENE_NAME}_CAM_FRONT.mp4"
     if not os.path.exists(target):
         return jsonify({"url": None})
-    ext = os.path.splitext(target)[1].lower()
-    if ext in {".mp4", ".mov", ".avi", ".mkv"}:
-        return jsonify({"url": "/video/preview"})
-    return jsonify({"url": None})
+    return jsonify({"url": "/video/preview"})
+
+@flask_app.route('/video/preview')
+def video_preview():
+    target = f"output_nuscenes/{_ACTIVE_SCENE_NAME}/{_ACTIVE_SCENE_NAME}_CAM_FRONT.mp4"
+    if not os.path.exists(target):
+        return ("Not found", 404)
+    return send_file(target, mimetype='video/mp4', conditional=True)
 
 @flask_app.route("/api/annotated-frames")
 def api_annotated_frames():
     import glob, re
-    files = glob.glob("output/scene/frame_sec_*_yolo.jpg")
+    search_dir = os.path.join(_SCENE_OUT_DIR, "full", "scene")
+    files = glob.glob(f"{search_dir}/frame_sec_*_yolo.jpg")
     if not files:
-        files = [f for f in glob.glob("output/scene/frame_sec_*.jpg") if "_yolo" not in f]
+        files = [f for f in glob.glob(f"{search_dir}/frame_sec_*.jpg") if "_yolo" not in f]
     frames = []
     for f in files:
         m = re.search(r'frame_sec_(\d+)', os.path.basename(f))
         if m:
             sec = int(m.group(1))
             frames.append({"sec": sec, "url": f"/frames/annotated/{sec}"})
-    frames.sort(key=lambda x: x["sec"]) 
+    frames.sort(key=lambda x: x["sec"])
     return jsonify({"frames": frames})
 
 @flask_app.route("/frames/annotated/<int:sec>")
 def frame_annotated(sec):
-    base = os.path.abspath("output/scene")
-    yolo_path  = os.path.join(base, f"frame_sec_{sec}_yolo.jpg")
+    base      = os.path.abspath(os.path.join(_SCENE_OUT_DIR, "full", "scene"))
+    yolo_path = os.path.join(base, f"frame_sec_{sec}_yolo.jpg")
     plain_path = os.path.join(base, f"frame_sec_{sec}.jpg")
     if os.path.exists(yolo_path):
         return send_file(yolo_path, mimetype="image/jpeg")
     if os.path.exists(plain_path):
         return send_file(plain_path, mimetype="image/jpeg")
     return ("Not found", 404)
-@flask_app.route('/video/preview')
-def video_preview():
-    target = DEFAULT_TARGET
-    if not os.path.exists(target):
-        return ("Not found", 404)
-    return send_file(target, mimetype='video/mp4', conditional=True)
 @flask_app.route("/api/submit", methods=["POST"])
 def api_submit():
     data             = request.get_json(force=True)
@@ -1228,6 +1030,12 @@ def _cleanup_ngrok():
         except (OSError, ProcessLookupError) as e:
             print(f"⚠  ngrok process cleanup failed: {e}")
 
+def _print_public_urls(base_url: str):
+    scene = _ACTIVE_SCENE_NAME or "static"
+    print(f"\n  PUBLIC — full form  : {base_url}/?scene_id={scene}")
+    print(f"  PUBLIC — simple form: {base_url}/simple?scene_id={scene}")
+
+
 def _try_ngrok(port):
     global _ngrok_proc
     try:
@@ -1235,7 +1043,7 @@ def _try_ngrok(port):
         _ngrok_conf.get_default().auth_token = os.getenv("NGROK_AUTH_TOKEN", "")
         tunnel = _ngrok.connect(port, "http")
         url = tunnel.public_url.replace("http://", "https://")
-        print(f"\n  PUBLIC URL (share this): {url}/?scene_id=static")
+        _print_public_urls(url)
         return url
     except ImportError:
         pass
@@ -1255,10 +1063,23 @@ def _try_ngrok(port):
             m = re.search(r"https://[\w\-]+\.ngrok[\.\-]\S+", line)
             if m:
                 url = m.group(0).rstrip("/")
-                print(f"\n  PUBLIC URL: {url}/?scene_id=static")
+                _print_public_urls(url)
                 return url
     except (FileNotFoundError, Exception):
         pass
+
+    # Final fallback: query the local ngrok inspector (works if a tunnel is
+    # already up from a previous run / external launch).
+    try:
+        import urllib.request, json as _json
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
+            for t in _json.load(r).get("tunnels", []):
+                if t.get("proto") == "https" and str(port) in t.get("config", {}).get("addr", ""):
+                    _print_public_urls(t["public_url"].rstrip("/"))
+                    return t["public_url"]
+    except Exception:
+        pass
+
     print("  ngrok not found — only accessible on local network.")
     return None
 
@@ -1269,19 +1090,21 @@ def start_server(port=SERVER_PORT):
     t = Thread(target=_run, daemon=True)
     t.start()
     time.sleep(1.5)
-    print(f"\n  Local: http://localhost:{port}/?scene_id=static")
+    scene = _ACTIVE_SCENE_NAME or "static"
+    print(f"\n  LOCAL  — full form  : http://localhost:{port}/?scene_id={scene}")
+    print(f"  LOCAL  — simple form: http://localhost:{port}/simple?scene_id={scene}")
     _try_ngrok(port)
     print(f"  Press Ctrl+C to stop.\n")
 
 
 # ── Flat cumulative (single Qwen text call over all tracker + per-second data) ─
-def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> dict:
+def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None, scene_dir: str = "output/scene", summaries_dir: str = "output/summaries", frames_dir: str = "output/frames") -> dict:
     """Replace the hierarchical tree with one Qwen text call.
     All object-level facts come from the tracker; Qwen only writes the narrative."""
     second_paths = [
-        f"output/scene/output_sec_{s}.json"
+        f"{scene_dir}/output_sec_{s}.json"
         for s in range(num_seconds)
-        if os.path.exists(f"output/scene/output_sec_{s}.json")
+        if os.path.exists(f"{scene_dir}/output_sec_{s}.json")
     ]
     if not second_paths:
         print("  No per-second files found. Skipping cumulative.")
@@ -1397,23 +1220,8 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
             entry["fragment_count"] = len(agg["track_ids"])
         objects_seen.append(entry)
 
-    env = (stable_fields or {}).get("environment", "")
-    # Lighting: pick the most common value chosen by Qwen across all keyframes
-    # (each keyframe's value lives in its scene_summary). Falls back to the
-    # NuScenes-derived default if Qwen never returned a valid value.
-    light_votes = []
-    for p in second_paths:
-        try:
-            with open(p) as _f:
-                lv = json.load(_f).get("scene_summary", {}).get("lighting", "")
-            if lv:
-                light_votes.append(lv)
-        except (IOError, json.JSONDecodeError):
-            continue
-    if light_votes:
-        light = max(set(light_votes), key=light_votes.count)
-    else:
-        light = (stable_fields or {}).get("lighting_default", "")
+    env   = (stable_fields or {}).get("environment", "")
+    light = (stable_fields or {}).get("lighting",    "")
     scene_id = f"video_0_{num_seconds - 1}"
 
     # Split moving vs static so Qwen focuses narrative on motion
@@ -1438,8 +1246,8 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
     try:
         from yolo_bytetrack import _ego_poses as _eps
         SWEEP_FPS = 12.0
-        if _eps and os.path.exists("output/keyframe_map.json"):
-            with open("output/keyframe_map.json") as _f:
+        if _eps and os.path.exists(os.path.join(_SCENE_OUT_DIR, "full", "keyframe_map.json")):
+            with open(os.path.join(_SCENE_OUT_DIR, "full", "keyframe_map.json")) as _f:
                 _km = json.load(_f)
             timeline = []  # (sec, moving_bool)
             for kf in _km:
@@ -1478,7 +1286,6 @@ def generate_flat_cumulative(num_seconds: int, stable_fields: dict = None) -> di
         print(f"  ⚠  ego timeline computation failed: {_e}")
 
     env_options      = " | ".join(FIELD_OPTIONS["environment"])
-    lighting_options = " | ".join(FIELD_OPTIONS["lighting"])
     density_options  = " | ".join(FIELD_OPTIONS["traffic_density"])
     flow_options     = " | ".join(FIELD_OPTIONS["traffic_flow"])
 
@@ -1519,7 +1326,6 @@ No markdown, no explanation, no extra keys.
 {{
   "scene_id": "{scene_id}",
   "environment": "<{env_options}>",
-  "lighting": "<{lighting_options}>",
   "traffic_density": "<{density_options}>",
   "traffic_flow": "<{flow_options}>",
   "scene_narrative": "<5 sentences synthesized from the data above. Sentence 1: environment type and overall layout. Sentence 2: each vehicle (if exists) with its color, size, and action — use exact color/size from moving_objects and static_objects data. Sentence 3:(if exists) pedestrians and cyclists with their actions. Sentence 4: (if exists) describe movements using the direction from moving_objects only. Sentence 5: ego-vehicle motion using ONLY the ego_motion line above (e.g. mention if the ego car stopped mid-video or moved throughout — use the seconds given verbatim, do not invent any).>",
@@ -1539,10 +1345,14 @@ RULES:
     print(f"  frame_summaries count: {len(frame_summaries)}")
     print(f"  Prompt chars         : {len(prompt)}")
     print(f"  Prompt est. tokens   : ~{int(len(prompt.split()) * 1.3)}")
+    _t_cumulative_qwen = time.perf_counter()
     result = _call_with_retry(call_qwen_text, prompt)
+    print(f"  Cumulative Qwen call : {time.perf_counter() - _t_cumulative_qwen:.1f}s")
     cumulative = result if isinstance(result, dict) else {}
     cumulative["annotator_type"] = "ai"
     cumulative["scene_id"]       = scene_id
+    cumulative["environment"]    = env
+    cumulative["lighting"]       = light
     cumulative["time_span"]      = {"start_second": 0, "end_second": num_seconds - 1}
     cumulative["total_cones"]    = len(ucn)
     cumulative["total_barriers"] = len(ubr)
@@ -1685,7 +1495,7 @@ RULES:
                     gt_vis40[it] = st
         track_instances: dict = {}   
         instance_tracks: dict = {}  
-        for ff in sorted(_glob.glob("output/frames/frame_*.json")):
+        for ff in sorted(_glob.glob(f"{frames_dir}/frame_*.json")):
             m = _re.match(r".*frame_(\d+)\.json", ff)
             if not m:
                 continue
@@ -1704,7 +1514,7 @@ RULES:
                 if tid < 0:
                     continue
                 ybb = yo.get("bounding_box", {})
-                best_iou, best_it = 0.25, None
+                best_iou, best_it = 0.20, None
                 for ga in gt_anns:
                     iou = _bbox_iou(ybb, ga.get("bbox_2d", {}))
                     if iou > best_iou:
@@ -1737,21 +1547,21 @@ RULES:
         print(f"  GT validation: recall={recall:.1%}, "
               f"split={len(split_tracks)}, fragmented={len(fragmented_gt)}")
 
-    os.makedirs("output/summaries", exist_ok=True)
-    _dump_json("output/summaries/output_cumulative_mega.json", cumulative)
-    print("  Saved: output/summaries/output_cumulative_mega.json")
+    os.makedirs(summaries_dir, exist_ok=True)
+    _dump_json(f"{summaries_dir}/output_cumulative_mega.json", cumulative)
+    print(f"  Saved: {summaries_dir}/output_cumulative_mega.json")
     return cumulative
 
 def process_scene(scene_name: str):
     """
-    NuScenes scene pipeline (sweep-based, no mp4 required):
-      1. process_scene_sweeps  → YOLO + ByteTracker on every CAM_FRONT sweep
-                                 (~12 Hz); writes output/keyframes/*.json
-                                 (one per sample, 2 Hz) + output/keyframe_map.json
-      2. Qwen analyse_frame    → one call per keyframe (sample), reading the
-                                 sample JPG directly via the SDK
-      3. generate_flat_cumulative across all keyframes
+    Run the full pipeline for one scene. Saves all output to:
+        output/<scene_name>/full/   — all objects
+        output/<scene_name>/top3/   — top-3 objects only
+
+    Does NOT start the Flask server — use serve_form.py for that.
     """
+    global _SCENE_OUT_DIR, _ACTIVE_SCENE_NAME
+
     if not TRACKER_AVAILABLE or process_scene_sweeps is None:
         sys.exit("Tracker / nuScenes SDK not available — cannot run scene pipeline.")
     from nuscenes.nuscenes import NuScenes
@@ -1759,14 +1569,45 @@ def process_scene(scene_name: str):
     if reset_gt_state is not None:
         reset_gt_state()
 
-    if os.path.exists("output"):
-        print("Clearing existing output folder...")
-        shutil.rmtree("output", ignore_errors=True)
-    for _d in ["output", "output/frames", "output/annotated", "output/keyframes",
-               "output/scene", "output/yolo_raw", "output/summaries"]:
+    _resume   = "--resume" in sys.argv
+    _no_qwen  = "--no-qwen" in sys.argv
+
+    # Optional manual override: --top3 id1,id2,id3   and   --sec N
+    _override_ids = None
+    _override_sec = None
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--top3" and _i + 1 < len(sys.argv):
+            _override_ids = [x.strip() for x in sys.argv[_i + 1].split(",") if x.strip()][:3]
+        elif _a == "--sec" and _i + 1 < len(sys.argv):
+            try:
+                _override_sec = int(sys.argv[_i + 1])
+            except ValueError:
+                pass
+    if _override_ids and len(_override_ids) != 3:
+        sys.exit(f"--top3 needs exactly 3 comma-separated identities (got {len(_override_ids)})")
+
+    SCENE_ROOT = f"output/{scene_name}"
+    FULL_OUT   = f"{SCENE_ROOT}/full"
+    TOP3_OUT   = f"{SCENE_ROOT}/top3"
+
+    # Set globals so any route called during pipeline also resolves correctly
+    _SCENE_OUT_DIR    = SCENE_ROOT
+    _ACTIVE_SCENE_NAME = scene_name
+
+    if _resume:
+        print(f"  --resume: keeping existing output for {scene_name}.")
+    else:
+        if os.path.exists(SCENE_ROOT):
+            print(f"Clearing existing output for {scene_name}…")
+            shutil.rmtree(SCENE_ROOT, ignore_errors=True)
+
+    for _d in [
+        FULL_OUT,
+        f"{FULL_OUT}/frames", f"{FULL_OUT}/annotated", f"{FULL_OUT}/keyframes",
+        f"{FULL_OUT}/scene",  f"{FULL_OUT}/yolo_raw",  f"{FULL_OUT}/summaries",
+    ]:
         os.makedirs(_d, exist_ok=True)
-    # Open the NuScenes handle ONCE and project GT before sweeps so
-    # run_yolo_and_track can inject missed objects into ByteTracker.
+
     nusc         = NuScenes(version="v1.0-mini", dataroot=NUSCENES_DATAROOT, verbose=False)
     scene_record = next((s for s in nusc.scene if scene_name in s["name"]), None)
     if scene_record is None:
@@ -1786,33 +1627,30 @@ def process_scene(scene_name: str):
     except Exception as _e:
         print(f"  ⚠  GT 2D projection failed: {_e}")
 
-    print(f"\n Step 1: YOLO + ByteTracker on scene '{scene_name}' (sweeps)...")
-    process_scene_sweeps(scene_name, dataroot=NUSCENES_DATAROOT, out_dir="output")
-    print("\n Step 2: Qwen per-keyframe scene analysis...")
-    with open("output/keyframe_map.json") as f:
+    print(f"\n Step 1: YOLO + ByteTracker → {FULL_OUT}/")
+    process_scene_sweeps(scene_name, dataroot=NUSCENES_DATAROOT, out_dir=FULL_OUT)
+
+    with open(f"{FULL_OUT}/keyframe_map.json") as f:
         keyframe_map = json.load(f)
     if not keyframe_map:
-        sys.exit("No keyframes found in output/keyframe_map.json")
-    nusc_desc      = (scene_record or {}).get("description", "")
-    inferred       = _infer_scene_fields_from_nuscenes(nusc_desc)
-    stable_fields  = {
+        sys.exit(f"No keyframes found in {FULL_OUT}/keyframe_map.json")
+
+    nusc_desc     = (scene_record or {}).get("description", "")
+    inferred      = _infer_scene_fields_from_nuscenes(nusc_desc)
+    stable_fields = {
         "environment":          inferred["environment"],
-        "lighting_options":     inferred["lighting_options"],
-        "lighting_default":     inferred["lighting_default"],
-        "is_night":             inferred["is_night"],
+        "lighting":             inferred["lighting"],
         "nuscenes_description": nusc_desc,
     }
-    print(f"  Scene metadata → env={inferred['environment']!r}, "
-          f"lighting subset={inferred['lighting_options']} "
-          f"({'night' if inferred['is_night'] else 'day'})")
+    print(f"  env={inferred['environment']!r}, lighting={inferred['lighting']!r}")
+
     frames_data = []
     for kf in keyframe_map:
         sample   = nusc.get("sample", kf["sample_token"])
         sd       = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
         img_path = os.path.join(NUSCENES_DATAROOT, sd["filename"])
         frame    = cv2.imread(img_path)
-
-        kf_json_path = f"output/keyframes/keyframe_{kf['sample_idx']:04d}.json"
+        kf_json_path = f"{FULL_OUT}/keyframes/keyframe_{kf['sample_idx']:04d}.json"
         yolo_data    = None
         if os.path.exists(kf_json_path):
             try:
@@ -1822,40 +1660,248 @@ def process_scene(scene_name: str):
                 print(f"  ⚠  Keyframe load failed (sample {kf['sample_idx']}): {e}")
         frames_data.append((kf["sample_idx"], frame, yolo_data, kf["frame_idx"]))
 
-    def _analyse_kf(item):
-        sec, frame, yolo_data, frame_idx = item
-        if frame is None:
-            return
-        out_json = f"output/scene/output_sec_{sec}.json"
-        if os.path.exists(out_json):
-            print(f"   Skipping keyframe {sec} (already analysed)")
-            return
+    if _no_qwen:
+        print("\n Step 2 & 3 SKIPPED (--no-qwen): YOLO output only.")
+    else:
+        print("\n Step 2: Qwen per-keyframe analysis...")
+
+        def _analyse_kf(item):
+            sec, frame, yolo_data, frame_idx = item
+            if frame is None:
+                return
+            out_json = f"{FULL_OUT}/scene/output_sec_{sec}.json"
+            if os.path.exists(out_json):
+                print(f"   Skipping keyframe {sec} (already analysed)")
+                return
+            try:
+                analyse_frame(
+                    frame, str(sec),
+                    out_json_path = out_json,
+                    out_img_path  = f"{FULL_OUT}/scene/frame_sec_{sec}.jpg",
+                    yolo_data     = yolo_data,
+                    frame_idx     = frame_idx,
+                    stable_fields = stable_fields,
+                )
+            except Exception as e:
+                print(f"  ⚠  analyse_frame failed (keyframe {sec}): {e}")
+
+        _t2 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            list(pool.map(_analyse_kf, frames_data))
+        print(f"\n✅ Step 2 done in {time.perf_counter()-_t2:.1f}s")
+
+        print("\n Step 3: Flat cumulative (all objects)...")
+        _t3 = time.perf_counter()
+        generate_flat_cumulative(
+            len(frames_data),
+            stable_fields = stable_fields,
+            scene_dir     = f"{FULL_OUT}/scene",
+            summaries_dir = f"{FULL_OUT}/summaries",
+            frames_dir    = f"{FULL_OUT}/frames",
+        )
+        print(f"✅ Step 3 done in {time.perf_counter()-_t3:.1f}s")
+
+    # ── Phase 2: top-3 ───────────────────────────────────────────────────
+    if TOP3_PIPELINE_AVAILABLE and run_top3_phase is not None:
+        print("\n" + "═"*55)
+        print("  PHASE 2: top-3 filtered pipeline")
+        print("═"*55)
+        sweep_fps = 2.0
         try:
-            analyse_frame(
-                frame, str(sec),
-                out_json_path = out_json,
-                out_img_path  = f"output/scene/frame_sec_{sec}.jpg",
-                yolo_data     = yolo_data,
-                frame_idx     = frame_idx,
-                stable_fields = stable_fields,
-            )
-        except Exception as e:
-            print(f"  ⚠  analyse_frame failed (keyframe {sec}): {e}")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        list(pool.map(_analyse_kf, frames_data))
-    print("\n Step 3: Building flat cumulative summary...")
-    generate_flat_cumulative(len(frames_data), stable_fields=stable_fields)
-    _ensure_spreadsheet()
-    start_server()
-    print(f"\nProcessed {len(frames_data)} keyframes. Open the form in browser.")
+            ts_list = [k["timestamp"] for k in keyframe_map if "timestamp" in k]
+            if len(ts_list) >= 2:
+                duration  = (ts_list[-1] - ts_list[0]) / 1e6
+                sweep_fps = max(1.0, len(ts_list) / duration)
+        except Exception:
+            pass
+        run_top3_phase(
+            full_out_dir    = FULL_OUT,
+            top3_out_dir    = TOP3_OUT,
+            nusc            = nusc,
+            dataroot        = NUSCENES_DATAROOT,
+            stable_fields   = stable_fields,
+            video_fps       = sweep_fps,
+            no_qwen         = _no_qwen,
+            override_ids    = _override_ids,
+            override_sec    = _override_sec,
+        )
+    else:
+        print("\n⚠  top3_pipeline not available — skipping Phase 2.")
+
+    print(f"\n{'='*55}")
+    print(f"  Pipeline complete for {scene_name}")
+    print(f"  Full output : {FULL_OUT}/")
+    print(f"  Top-3 output: {TOP3_OUT}/")
+    print(f"\n  To serve the form run:")
+    print(f"    python serve_form.py {scene_name}")
+    print(f"{'='*55}\n")
+# ── Simple survey routes ─────────────────────────────────────────────────────
+
+SIMPLE_SHEET_HEADERS = [
+    "Timestamp", "Participant Name", "Country", "Age Category", "Gender",
+    "Profession", "Driving Skill", "Scene ID",
+    "Free Text Response",
+]
+_SIMPLE_TAB_NAME = "Simple Annotations"
+
+
+def _ensure_simple_tab():
+    sid = _ensure_spreadsheet()
+    svc = _get_sheets()
+    if not sid or not svc:
+        return False
     try:
-        while True:
-            time.sleep(5)
-    except KeyboardInterrupt:
-        print("\nStopping.")
-        _cleanup_ngrok()
-# Entry 
+        meta     = svc.spreadsheets().get(spreadsheetId=sid).execute()
+        existing = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        if _SIMPLE_TAB_NAME not in existing:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests": [{"addSheet": {"properties": {"title": _SIMPLE_TAB_NAME}}}]}
+            ).execute()
+            last_col = chr(ord("A") + len(SIMPLE_SHEET_HEADERS) - 1)
+            svc.spreadsheets().values().update(
+                spreadsheetId=sid,
+                range=f"{_SIMPLE_TAB_NAME}!A1",
+                valueInputOption="RAW",
+                body={"values": [SIMPLE_SHEET_HEADERS]}
+            ).execute()
+            print(f"✓ Created tab: {_SIMPLE_TAB_NAME}")
+        return True
+    except Exception as e:
+        print(f"⚠  Could not ensure simple tab: {e}")
+        return False
+
+
+def _append_simple_row(summary: dict) -> bool:
+    _ensure_simple_tab()
+    sid = _ensure_spreadsheet()
+    svc = _get_sheets()
+    if not sid or not svc:
+        return False
+    try:
+        p_info = summary.get("participant_info", {})
+        row = [
+            datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            p_info.get("name",          summary.get("participant_name", "")),
+            p_info.get("country",       ""),
+            p_info.get("age_category",  ""),
+            p_info.get("gender",        ""),
+            p_info.get("profession",    ""),
+            p_info.get("driving_skill", ""),
+            summary.get("scene_id", ""),
+            summary.get("free_text", ""),
+        ]
+        last_col = chr(ord("A") + len(SIMPLE_SHEET_HEADERS) - 1)
+        svc.spreadsheets().values().append(
+            spreadsheetId=sid,
+            range=f"{_SIMPLE_TAB_NAME}!A:{last_col}",
+            valueInputOption="RAW",
+            body={"values": [row]}
+        ).execute()
+        print("✓ Simple row appended to Google Sheet")
+        return True
+    except Exception as e:
+        print(f"⚠  Simple sheet append failed: {e}")
+        return False
+
+
+def _get_simple_top3():
+    """Read Phase 2 output directly — no re-detection."""
+    top3_dir = os.path.join(_SCENE_OUT_DIR, "top3")
+    rep_json = os.path.join(top3_dir, "representative_frame.json")
+
+    if not os.path.exists(rep_json):
+        return None, None, None, f"Phase 2 not run yet for {_ACTIVE_SCENE_NAME}. Run the pipeline first."
+
+    meta       = json.load(open(rep_json))
+    top3       = meta.get("top3_identities", [])
+    sample_idx = meta.get("sample_idx", None)
+
+    # Prefer the Qwen-annotated keyframe (top3/scene/frame_sec_<idx>.jpg);
+    # fall back to representative_frame.jpg if absent.
+    rep_img = os.path.join(top3_dir, "scene", f"frame_sec_{sample_idx}.jpg")
+    if not os.path.exists(rep_img):
+        rep_img = os.path.join(top3_dir, "representative_frame.jpg")
+
+    canvas_b64 = None
+    if os.path.exists(rep_img):
+        with open(rep_img, "rb") as f:
+            canvas_b64 = base64.b64encode(f.read()).decode()
+
+    parts = []
+    for obj in top3:
+        label     = obj.get("slot_label", "Object 1")
+        color     = obj.get("color", "")
+        color_str = f"{color} " if color and color not in ("unknown", "") else ""
+        otype     = obj.get("object_type", "object")
+        parts.append(f"{label} ({color_str}{otype})")
+    question_context = "; ".join(parts)
+
+    return top3, canvas_b64, sample_idx, question_context
+
+
+@flask_app.route("/simple")
+def serve_simple_form():
+    return render_template("form_simple.html")
+
+
+@flask_app.route("/api/simple/top3")
+def api_simple_top3():
+    try:
+        top3, canvas_b64, sample_idx, question_context = _get_simple_top3()
+        if top3 is None:
+            return jsonify({"error": question_context}), 404
+        safe_top3 = [{k: v for k, v in obj.items() if k != "slot_color"} for obj in top3]
+        return jsonify({
+            "top3":             safe_top3,
+            "question_context": question_context,
+            "frame_b64":        canvas_b64,
+            "sample_idx":       sample_idx,
+            "scene_id":         TARGET_SCENE or "unknown",
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/api/submit_simple", methods=["POST"])
+def api_submit_simple():
+    data             = request.get_json(force=True)
+    participant_name = data.get("participant_name", "").strip()
+    free_text        = data.get("free_text", "").strip()
+    top3_objects     = data.get("top3_objects", [])
+    scene_id         = data.get("scene_id", TARGET_SCENE or "unknown")
+
+    if not participant_name or not free_text:
+        return jsonify({"error": "participant_name and free_text are required"}), 400
+
+    summary = {
+        "annotator_type":   "human_simple",
+        "participant_name": participant_name,
+        "participant_info": data.get("participant_info", {}),
+        "scene_id":         scene_id,
+        "free_text":        free_text,
+        "top3_objects":     top3_objects,
+    }
+    os.makedirs(f"annotations/{_ACTIVE_SCENE_NAME}/simple", exist_ok=True)
+    fname = f"annotations/{_ACTIVE_SCENE_NAME}/simple/{participant_name}_{scene_id}_simple.json"
+    with open(fname, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"✓ Simple annotation saved: {fname}")
+
+    saved_to_sheets = _append_simple_row(summary)
+    return jsonify({"success": True, "sheets": saved_to_sheets})
+
+
+@flask_app.route("/simple/frames/latest")
+def simple_frame_latest():
+    path = os.path.abspath(os.path.join(_SCENE_OUT_DIR, "top3", "representative_frame.jpg"))
+    if os.path.exists(path):
+        return send_file(path, mimetype="image/jpeg")
+    return ("Not found", 404)
+
+
+# Entry
 if __name__ == "__main__":
     scene = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SCENE
-    DEFAULT_TARGET = f"output_nuscenes/{scene}/{scene}_CAM_FRONT.mp4"
     process_scene(scene)

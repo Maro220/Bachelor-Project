@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scene Observation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+        --ink: #1a1a2e;
+        --ink2: #4a4a6a;
+        --ink3: #8888aa;
+        --surface: #ffffff;
+        --surface2: #f4f4f8;
+        --surface3: #eeeef6;
+        --accent: #5b4fcf;
+        --accent2: #7b6fe8;
+        --accent-bg: #eeedfb;
+        --ok: #1a7a4a;
+        --ok-bg: #eaf7f0;
+        --err: #b52020;
+        --err-bg: #fdf0f0;
+        --warn: #c85a00;
+        --warn-bg: #fff4ec;
+        --border: #e0e0ec;
+        --radius: 10px;
+        --font: 'DM Sans', sans-serif;
+        --mono: 'DM Mono', monospace;
+    }
+
+    body {
+        font-family: var(--font);
+        background: var(--surface2);
+        color: var(--ink);
+        min-height: 100vh;
+        padding: 32px 16px 80px;
+        font-size: 15px;
+    }
+
+    .shell { max-width: 760px; margin: 0 auto; width: 100%; }
+
+    /* Header */
+    .hdr {
+        background: var(--accent);
+        border-radius: 14px 14px 0 0;
+        padding: 22px 28px 18px;
+        color: #fff;
+    }
+    .hdr h1 { font-size: 19px; font-weight: 600; letter-spacing: -.2px; }
+    .hdr .sub { font-size: 13px; opacity: .75; margin-top: 3px; }
+    .hdr .badge {
+        display: inline-block;
+        background: rgba(255,255,255,.18);
+        border-radius: 20px;
+        padding: 2px 10px;
+        font-size: 12px;
+        font-family: var(--mono);
+        margin-top: 8px;
+    }
+
+    .body {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-top: none;
+        border-radius: 0 0 14px 14px;
+        padding: 28px;
+    }
+
+    /* Step indicator */
+    .step-indicator {
+        display: flex; align-items: center; justify-content: center;
+        gap: 8px; margin-bottom: 24px;
+    }
+    .step-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); transition: background .25s; }
+    .step-dot.active { background: var(--accent); }
+    .step-line { flex: 1; max-width: 40px; height: 2px; background: var(--border); border-radius: 2px; transition: background .25s; }
+    .step-line.done-line { background: var(--accent); }
+
+    /* Intro welcome */
+    .intro-welcome { text-align: center; margin-bottom: 28px; }
+    .intro-welcome .welcome-icon {
+        width: 56px; height: 56px; border-radius: 50%;
+        background: var(--accent-bg);
+        display: flex; align-items: center; justify-content: center;
+        margin: 0 auto 14px; font-size: 26px;
+    }
+    .intro-welcome h2 { font-size: 18px; font-weight: 600; color: var(--ink); margin-bottom: 6px; }
+    .intro-welcome p { font-size: 13px; color: var(--ink3); line-height: 1.6; max-width: 480px; margin: 0 auto; }
+
+    /* Fields */
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 5px; color: var(--ink); }
+    .field label .req { color: #c00; margin-left: 2px; }
+    .field label .hint { font-weight: 400; color: var(--ink3); font-size: 12px; margin-left: 6px; }
+
+    input[type=text], select, textarea {
+        width: 100%; padding: 9px 12px; font-size: 14px;
+        font-family: var(--font); border: 1.5px solid var(--border);
+        border-radius: var(--radius); background: var(--surface);
+        color: var(--ink); transition: border-color .15s, box-shadow .15s;
+    }
+    input:focus, textarea:focus, select:focus {
+        outline: none; border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(91,79,207,.12);
+    }
+
+    /* Driving skill */
+    .skill-rating { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 8px; }
+    @media (max-width: 520px) { .skill-rating { grid-template-columns: repeat(3, 1fr); } }
+    .skill-btn {
+        padding: 14px 6px 10px; border: 1.5px solid var(--border);
+        border-radius: var(--radius); background: var(--surface2);
+        font-family: var(--font); font-size: 11px; font-weight: 600;
+        color: var(--ink3); cursor: pointer; text-align: center;
+        transition: all .18s; display: flex; flex-direction: column; align-items: center; gap: 6px; line-height: 1.2;
+    }
+    .skill-btn .skill-bar { width: 100%; height: 3px; border-radius: 2px; background: var(--border); margin-top: 6px; overflow: hidden; }
+    .skill-btn .skill-bar-fill { height: 100%; border-radius: 2px; background: var(--border); transition: background .18s; }
+    .skill-btn:hover { border-color: var(--accent2); color: var(--ink); background: var(--accent-bg); }
+    .skill-btn:hover .skill-bar-fill { background: var(--accent2); }
+    .skill-btn.selected { border-color: var(--accent); background: var(--accent); color: #fff; }
+    .skill-btn.selected .skill-bar-fill { background: rgba(255,255,255,.6); }
+
+    /* Two-column intro grid */
+    .intro-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+    @media (max-width: 520px) { .intro-grid { grid-template-columns: 1fr; } }
+    .intro-grid .field { margin-bottom: 0; }
+
+    /* Sec label */
+    .sec-label {
+        font-size: 11px; font-weight: 600; letter-spacing: .1em;
+        text-transform: uppercase; color: var(--accent);
+        margin-bottom: 14px; padding-bottom: 7px;
+        border-bottom: 2px solid var(--accent-bg);
+    }
+
+    /* Frame display */
+    .frame-wrap {
+        position: relative;
+        margin-bottom: 24px;
+        border-radius: var(--radius);
+        overflow: hidden;
+        border: 1px solid var(--border);
+        background: #000;
+    }
+    .frame-wrap img { width: 100%; display: block; }
+    .frame-loading {
+        height: 220px; display: flex; align-items: center; justify-content: center;
+        color: var(--ink3); font-size: 14px; background: var(--surface2);
+        border-radius: var(--radius); border: 1.5px dashed var(--border);
+        margin-bottom: 24px;
+    }
+
+    /* Object legend pills */
+    .obj-legend {
+        display: flex; gap: 10px; flex-wrap: wrap;
+        margin-bottom: 20px;
+    }
+    .obj-pill {
+        display: flex; align-items: center; gap: 7px;
+        padding: 6px 12px; border-radius: 20px;
+        font-size: 12px; font-weight: 600;
+        border: 1.5px solid;
+    }
+    .obj-pill .dot { width: 10px; height: 10px; border-radius: 50%; }
+
+    /* Question box */
+    .question-box {
+        background: var(--accent-bg);
+        border: 1.5px solid #d4cef2;
+        border-left: 4px solid var(--accent);
+        border-radius: 0 var(--radius) var(--radius) 0;
+        padding: 14px 16px;
+        font-size: 14px;
+        color: #3a2fa0;
+        line-height: 1.65;
+        margin-bottom: 16px;
+    }
+    .question-box strong { font-weight: 600; }
+
+    textarea { min-height: 140px; resize: vertical; line-height: 1.6; }
+
+    /* Voice */
+    .voice-row { display: flex; gap: 8px; align-items: flex-start; }
+    .voice-row textarea { flex: 1; }
+    .btn-mic {
+        flex: 0 0 auto; width: 42px; height: 42px;
+        border-radius: 8px; border: 1.5px solid var(--border);
+        background: var(--surface2); color: var(--ink2);
+        font-size: 18px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        transition: all .15s; padding: 0; font-family: var(--font);
+    }
+    .btn-mic:hover { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
+    .btn-mic.recording { background: var(--err-bg); border-color: var(--err); color: var(--err); animation: micPulse 1s infinite; }
+    .btn-mic:disabled { opacity: .5; cursor: not-allowed; }
+    .voice-hint { font-size: 11px; color: var(--ink3); margin-top: 4px; }
+
+    @keyframes micPulse {
+        0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(181,32,32,.3); }
+        50%       { opacity: .8; box-shadow: 0 0 0 5px rgba(181,32,32,0); }
+    }
+
+    /* Word counter */
+    .word-counter { font-size: 12px; color: var(--ink3); margin-top: 5px; display: flex; justify-content: space-between; }
+    .word-counter.warning { color: var(--warn); }
+    .word-counter.ok { color: var(--ok); }
+
+    /* Buttons */
+    .btn {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 10px 20px; border: none; border-radius: var(--radius);
+        font-size: 14px; font-weight: 500; font-family: var(--font);
+        cursor: pointer; transition: opacity .15s, transform .1s;
+    }
+    .btn:active { transform: scale(.98); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-back {
+        background: none; border: 1.5px solid var(--border);
+        border-radius: var(--radius); color: var(--ink2);
+        font-family: var(--font); font-size: 14px; font-weight: 500;
+        padding: 10px 18px; cursor: pointer;
+        transition: border-color .15s, color .15s;
+        display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-back:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+
+    .spin {
+        display: inline-block; width: 13px; height: 13px;
+        border: 2px solid currentColor; border-top-color: transparent;
+        border-radius: 50%; animation: rot .65s linear infinite;
+    }
+    @keyframes rot { to { transform: rotate(360deg); } }
+
+    .status { margin-top: 14px; padding: 11px 14px; border-radius: var(--radius); font-size: 14px; display: none; }
+    .status.info  { display: block; background: #e8f0fd; color: #1a3a8c; }
+    .status.ok    { display: block; background: var(--ok-bg); color: var(--ok); }
+    .status.warn  { display: block; background: var(--warn-bg); color: var(--warn); }
+    .status.err   { display: block; background: var(--err-bg); color: var(--err); }
+
+    .done { display: none; text-align: center; padding: 48px 20px; }
+    .done.on { display: block; }
+    .done-check {
+        width: 52px; height: 52px; border-radius: 50%; background: var(--ok-bg);
+        display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;
+    }
+    .done-check svg { width: 26px; height: 26px; stroke: var(--ok); fill: none; stroke-width: 2.5; }
+    .done h2 { font-size: 20px; font-weight: 500; color: var(--ok); margin-bottom: 8px; }
+    .done p { font-size: 14px; color: var(--ink3); }
+
+    .instruction-box {
+        background: var(--accent-bg);
+        border: 1.5px solid #d4cef2;
+        border-left: 4px solid var(--accent);
+        border-radius: 0 var(--radius) var(--radius) 0;
+        padding: 12px 14px; font-size: 13px; color: #3a2fa0;
+        line-height: 1.65; margin-bottom: 14px;
+    }
+    .instruction-box strong { font-weight: 600; }
+
+    .section-video {
+        border-radius: var(--radius); overflow: hidden;
+        border: 1px solid var(--border);
+        margin-bottom: 18px; position: relative;
+        background: #000;
+    }
+    .section-video video { width: 100%; display: block; }
+    .section-video .replay-btn {
+        position: absolute; right: 10px; bottom: 10px;
+        padding: 6px 10px; border-radius: 7px; border: none;
+        background: rgba(0,0,0,.6); color: #fff; cursor: pointer; font-size: 12px;
+    }
+
+    hr.divider { border: none; border-top: 1.5px solid var(--border); margin: 24px 0; }
+
+    /* Page slide */
+    .pages-outer { overflow: hidden; position: relative; width: 100%; }
+    .pages-track { display: flex; transition: transform .4s cubic-bezier(.4,0,.2,1); will-change: transform; }
+    .page-slide { flex: 0 0 100%; width: 100%; }
+
+    .intro-body {
+        background: var(--surface); border: 1px solid var(--border);
+        border-top: none; border-radius: 0 0 14px 14px; padding: 32px 28px;
+    }
+</style>
+</head>
+<body>
+<div class="shell">
+    <div class="hdr">
+        <h1>Scene Observation</h1>
+        <p class="sub">Quick annotation — describe what you observe</p>
+        <span class="badge" id="sceneIdLabel">scene: —</span>
+    </div>
+
+    <div class="pages-outer">
+    <div class="pages-track" id="pagesTrack">
+
+    <!-- PAGE 1 — About You -->
+    <div class="page-slide">
+    <div class="intro-body">
+        <div class="step-indicator">
+            <div class="step-dot active"></div>
+            <div class="step-line"></div>
+            <div class="step-dot"></div>
+        </div>
+
+        <div class="intro-welcome">
+            <div class="welcome-icon">👋</div>
+            <h2>Tell us a bit about yourself</h2>
+            <p>A few quick details before you begin. This helps contextualise your observations.</p>
+        </div>
+
+        <div class="intro-grid">
+            <div class="field" style="grid-column:1/-1">
+                <label for="p_name">Full name <span class="req">*</span></label>
+                <input type="text" id="p_name" required placeholder="e.g. Maria Andersen">
+            </div>
+            <div class="field">
+                <label for="p_country">Country of residence <span class="req">*</span></label>
+                <select id="p_country" required>
+                    <option value="">— select country —</option>
+                    <option>Afghanistan</option><option>Albania</option><option>Algeria</option>
+                    <option>Andorra</option><option>Angola</option><option>Argentina</option>
+                    <option>Australia</option><option>Austria</option><option>Egypt</option>
+                    <option>France</option><option>Germany</option><option>India</option>
+                    <option>Italy</option><option>Japan</option><option>Saudi Arabia</option>
+                    <option>Spain</option><option>United Arab Emirates</option>
+                    <option>United Kingdom</option><option>United States</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="p_age">Age category <span class="req">*</span></label>
+                <select id="p_age" required>
+                    <option value="">— select —</option>
+                    <option>Under 18</option><option>18–22</option><option>23–27</option>
+                    <option>28–35</option><option>36–45</option><option>45+</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="p_gender">Gender <span class="req">*</span></label>
+                <select id="p_gender" required>
+                    <option value="">— select —</option>
+                    <option>Female</option><option>Male</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="p_profession">Major / Profession <span class="req">*</span></label>
+                <input type="text" id="p_profession" required>
+            </div>
+        </div>
+
+        <div class="field" style="margin-bottom:24px">
+            <label>How do you rate your driving skills? <span class="req">*</span></label>
+            <div class="skill-rating" id="skillRating">
+                <button type="button" class="skill-btn" data-value="non-driver" onclick="selectSkill(this)">
+                    Non-driver
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:10%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="beginner" onclick="selectSkill(this)">
+                    Beginner
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:30%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="competent" onclick="selectSkill(this)">
+                    Competent
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:55%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="experienced" onclick="selectSkill(this)">
+                    Experienced
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:80%"></div></div>
+                </button>
+                <button type="button" class="skill-btn" data-value="expert" onclick="selectSkill(this)">
+                    Expert
+                    <div class="skill-bar"><div class="skill-bar-fill" style="width:100%"></div></div>
+                </button>
+            </div>
+            <input type="hidden" id="p_driving_skill" value="">
+        </div>
+
+        <div class="btn-row">
+            <button class="btn btn-primary" onclick="goToPage2()" style="width:100%;justify-content:center">
+                Continue →
+            </button>
+        </div>
+        <div class="status" id="statusPage1"></div>
+    </div>
+    </div><!-- end page 1 -->
+
+    <!-- PAGE 2 — Observation -->
+    <div class="page-slide">
+    <div class="body" id="mainBody">
+        <div class="step-indicator">
+            <div class="step-dot active"></div>
+            <div class="step-line done-line"></div>
+            <div class="step-dot active"></div>
+        </div>
+
+        <!-- ── Part 1: Representative frame ── -->
+        <div class="sec-label">Step 1 — identify the objects</div>
+
+        <div class="instruction-box" id="frameInstruction">
+            The frame below is taken from the video. <strong>Three objects have been highlighted</strong> — keep track of them as you watch.
+        </div>
+
+        <!-- Annotated representative frame -->
+        <div id="frameContainer">
+            <div class="frame-loading" id="frameLoading">
+                <span>Loading scene…</span>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Part 2: Full video ── -->
+        <div class="sec-label">Step 2 — watch the full video</div>
+
+        <div class="instruction-box">
+            Watch the full scene video below. <strong>Track Object 1, 2, and 3</strong> throughout — observe their movements, actions, and interactions.
+        </div>
+
+        <div id="videoContainer">
+            <div class="frame-loading">Video loading…</div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- ── Part 3: Free text response ── -->
+        <div class="sec-label">Step 3 — describe what you observed</div>
+
+        <div class="question-box" id="questionBox">
+            Based on the video, describe what <strong>Object 1</strong>, <strong>Object 2</strong>, and <strong>Object 3</strong> were doing — include their movements, position, and any interactions you noticed.
+        </div>
+
+        <div class="field">
+            <label for="f_response">Your observation <span class="req">*</span>
+                <span class="hint">Describe each object across the full video</span>
+            </label>
+            <div class="voice-row">
+                <textarea id="f_response" rows="7"
+                    placeholder="Example: Object 1 is a white car that starts in the foreground and moves towards the right across the video. Object 2 is a pedestrian on the left side who crosses the road midway through. Object 3 is a blue truck that remains parked in the background throughout…"></textarea>
+                <button type="button" class="btn-mic" id="mic_f_response"
+                    onclick="toggleVoice('f_response')" title="Click to record, click again to stop">🎤</button>
+            </div>
+            <div class="voice-hint">🎤 Click the mic to dictate — your speech will be transcribed automatically</div>
+            <div class="word-counter" id="wordCounter">
+                <span><span id="wordCount">0</span> words</span>
+                <span id="wordStatus" style="color:#888">describe each object…</span>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <div class="btn-row">
+            <button class="btn-back" onclick="goToPage1()">← Back</button>
+            <button class="btn btn-primary" id="submitBtn" onclick="validateAndSubmit()">
+                Submit observation
+            </button>
+        </div>
+        <div class="status" id="statusPage2"></div>
+
+        <div class="done" id="done">
+            <div class="done-check">
+                <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+            <h2>Observation submitted</h2>
+            <p id="doneMsg">Your response has been saved.</p>
+        </div>
+    </div>
+    </div><!-- end page 2 -->
+
+    </div><!-- pages-track -->
+    </div><!-- pages-outer -->
+</div>
+
+<script>
+const SCENE_ID = new URLSearchParams(location.search).get('scene_id') || 'static';
+document.getElementById('sceneIdLabel').textContent = 'scene: ' + SCENE_ID;
+
+let _top3Data = [];  // stored after API call for submission
+
+// ── Load top-3 frame + video on page load ──
+(async () => {
+    try {
+        const r = await fetch('/api/simple/top3');
+        if (!r.ok) throw new Error('API error ' + r.status);
+        const d = await r.json();
+
+        _top3Data = d.top3 || [];
+
+        // ── Representative frame ──
+        const fc = document.getElementById('frameContainer');
+        const sampleSec = d.sample_idx !== undefined ? d.sample_idx : null;
+
+        if (d.frame_b64) {
+            const secLabel = sampleSec !== null
+                ? `This frame is from second <strong>${sampleSec/2}</strong> of the video.`
+                : 'Representative frame from the video.';
+            fc.innerHTML = `
+                <p style="font-size:12px;color:var(--ink3);margin-bottom:8px">${secLabel}</p>
+                <div class="frame-wrap"><img src="data:image/jpeg;base64,${d.frame_b64}" alt="Annotated scene"></div>`;
+            // Also update instruction box with the second number
+            if (sampleSec !== null) {
+                document.getElementById('frameInstruction').innerHTML =
+                    `The frame below is from <strong>second ${sampleSec/2}</strong> of the video. <strong>Three objects have been highlighted</strong> — keep track of them as you watch.`;
+            }
+        } else {
+            fc.innerHTML = `<div class="frame-loading">Frame not available — run the pipeline first.</div>`;
+        }
+
+        // ── Video ──
+        try {
+            const rv = await fetch('/api/scene-video?scene_id=' + encodeURIComponent(SCENE_ID));
+            const dv = await rv.json();
+            const vc = document.getElementById('videoContainer');
+            if (dv && dv.url) {
+                vc.innerHTML = `
+                    <div class="section-video">
+                        <video id="sceneVideo" controls playsinline>
+                            <source src="${dv.url}" type="video/mp4">
+                        </video>
+                        <button class="replay-btn" onclick="
+                            const v=document.getElementById('sceneVideo');
+                            if(v){v.currentTime=0;v.play();}">↺ Replay</button>
+                    </div>`;
+            } else {
+                vc.innerHTML = `<div class="frame-loading">Video not available.</div>`;
+            }
+        } catch (e) {
+            document.getElementById('videoContainer').innerHTML =
+                `<div class="frame-loading">Could not load video.</div>`;
+        }
+
+    } catch (e) {
+        document.getElementById('frameContainer').innerHTML =
+            `<div class="frame-loading">Could not load scene data. Make sure the pipeline has run.</div>`;
+        console.error(e);
+    }
+})();
+
+// ── Page navigation ──
+function goToPage2() {
+    const name       = document.getElementById('p_name').value.trim();
+    const country    = document.getElementById('p_country').value;
+    const age        = document.getElementById('p_age').value;
+    const gender     = document.getElementById('p_gender').value;
+    const profession = document.getElementById('p_profession').value.trim();
+    const skill      = document.getElementById('p_driving_skill').value;
+    const s1         = document.getElementById('statusPage1');
+
+    if (!name)       { showS1('Please enter your full name.', 'warn'); return; }
+    if (!country)    { showS1('Please select your country.', 'warn'); return; }
+    if (!age)        { showS1('Please select your age category.', 'warn'); return; }
+    if (!gender)     { showS1('Please select your gender.', 'warn'); return; }
+    if (!profession) { showS1('Please enter your profession.', 'warn'); return; }
+    if (!skill)      { showS1('Please rate your driving skills.', 'warn'); return; }
+
+    showS1('', '');
+    document.getElementById('pagesTrack').style.transform = 'translateX(-100%)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function goToPage1() {
+    document.getElementById('pagesTrack').style.transform = 'translateX(0)';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function selectSkill(btn) {
+    document.querySelectorAll('.skill-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    document.getElementById('p_driving_skill').value = btn.dataset.value;
+}
+
+function showS1(msg, type) {
+    const el = document.getElementById('statusPage1');
+    el.textContent = msg;
+    el.className   = 'status' + (msg ? ' ' + type : '');
+}
+
+// ── Word counter ──
+document.getElementById('f_response').addEventListener('input', () => {
+    const text  = document.getElementById('f_response').value;
+    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    document.getElementById('wordCount').textContent = words;
+    const counter  = document.getElementById('wordCounter');
+    const statusEl = document.getElementById('wordStatus');
+    if (words < 10) {
+        counter.className    = 'word-counter warning';
+        statusEl.textContent = 'describe each object…';
+        statusEl.style.color = 'var(--warn)';
+    } else {
+        counter.className    = 'word-counter ok';
+        statusEl.textContent = '✓ looks good';
+        statusEl.style.color = 'var(--ok)';
+    }
+});
+
+// ── Validate & submit ──
+async function validateAndSubmit() {
+    const response = document.getElementById('f_response').value.trim();
+    const words    = response ? response.split(/\s+/).length : 0;
+    const s2       = document.getElementById('statusPage2');
+
+    if (words < 10) {
+        s2.textContent = 'Please describe what you observe — at least a sentence per object.';
+        s2.className   = 'status warn';
+        return;
+    }
+    s2.className   = 'status';
+    s2.textContent = '';
+
+    const btn = document.getElementById('submitBtn');
+    btn.disabled    = true;
+    btn.innerHTML   = '<span class="spin"></span> Saving…';
+
+    try {
+        const payload = {
+            scene_id:         SCENE_ID,
+            participant_name: document.getElementById('p_name').value.trim(),
+            participant_info: {
+                name:          document.getElementById('p_name').value.trim(),
+                country:       document.getElementById('p_country').value,
+                age_category:  document.getElementById('p_age').value,
+                gender:        document.getElementById('p_gender').value,
+                profession:    document.getElementById('p_profession').value.trim(),
+                driving_skill: document.getElementById('p_driving_skill').value,
+            },
+            free_text:    response,
+            top3_objects: _top3Data,
+        };
+
+        const r = await fetch('/api/submit_simple', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+        });
+        const d = await r.json();
+
+        if (d.error) {
+            s2.textContent = 'Error: ' + d.error;
+            s2.className   = 'status err';
+            btn.disabled    = false;
+            btn.innerHTML   = 'Submit observation';
+            return;
+        }
+
+        document.getElementById('mainBody').style.opacity      = '.3';
+        document.getElementById('mainBody').style.pointerEvents = 'none';
+        btn.innerHTML = '✓ Submitted';
+        document.getElementById('doneMsg').textContent =
+            d.sheets ? 'Saved to Google Sheets and local backup.' : 'Saved locally.';
+        document.getElementById('done').classList.add('on');
+
+    } catch (e) {
+        s2.textContent = 'Submission error: ' + e.message;
+        s2.className   = 'status err';
+        btn.disabled    = false;
+        btn.innerHTML   = 'Submit observation';
+    }
+}
+
+// ── Voice input (same as form.html) ──
+let activeRecorder = null, activeStream = null, activeFieldId = null;
+
+async function toggleVoice(fieldId) {
+    const btn = document.getElementById('mic_' + fieldId);
+    if (activeRecorder && activeFieldId === fieldId) { activeRecorder.stop(); return; }
+    if (activeRecorder) { activeRecorder.stop(); await new Promise(r => setTimeout(r, 300)); }
+
+    try {
+        activeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+        alert('Microphone access denied.');
+        return;
+    }
+
+    const mimeType = ['audio/webm;codecs=opus','audio/webm','audio/ogg','audio/mp4']
+        .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    activeRecorder = new MediaRecorder(activeStream, mimeType ? { mimeType } : {});
+    activeFieldId  = fieldId;
+    const chunks   = [];
+
+    btn.classList.add('recording');
+    btn.textContent = '⏹';
+
+    activeRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+    let silenceTimer = null, audioCtx = null;
+
+    activeRecorder.onstop = async () => {
+        if (silenceTimer) clearInterval(silenceTimer);
+        if (audioCtx && audioCtx.state !== 'closed') audioCtx.close().catch(() => {});
+        document.querySelectorAll('.btn-mic').forEach(b => {
+            b.classList.remove('recording'); b.textContent = '🎤';
+        });
+        activeStream?.getTracks().forEach(t => t.stop());
+        if (!chunks.length) { activeRecorder = null; activeStream = null; return; }
+
+        btn.disabled = true; btn.textContent = '⏳';
+        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        const fd   = new FormData();
+        fd.append('audio', blob, 'recording.webm');
+
+        try {
+            const res  = await fetch('/api/transcribe', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (data.text?.trim()) {
+                const ta = document.getElementById(fieldId);
+                const ex = ta.value.trim();
+                ta.value = ex ? ex + ' ' + data.text.trim() : data.text.trim();
+                ta.dispatchEvent(new Event('input'));
+                ta.focus();
+            }
+        } catch (err) { alert('Transcription failed: ' + err.message); }
+
+        btn.disabled = false; btn.textContent = '🎤';
+        activeRecorder = null; activeStream = null; activeFieldId = null;
+    };
+
+    try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = audioCtx.createMediaStreamSource(activeStream);
+        const an  = audioCtx.createAnalyser();
+        an.fftSize = 512;
+        src.connect(an);
+        const buf = new Uint8Array(an.fftSize);
+        let lastSpeechAt = null;
+        silenceTimer = setInterval(() => {
+            if (!activeRecorder || activeRecorder.state !== 'recording') return;
+            an.getByteTimeDomainData(buf);
+            let ss = 0;
+            for (let i = 0; i < buf.length; i++) { const v = buf[i]-128; ss += v*v; }
+            const rms = Math.sqrt(ss/buf.length);
+            if (rms > 4) lastSpeechAt = Date.now();
+            if (lastSpeechAt && Date.now() - lastSpeechAt > 3000) activeRecorder.stop();
+        }, 100);
+    } catch {}
+
+    activeRecorder.start();
+}
+</script>
+</body>
+</html>

@@ -1,10 +1,4 @@
-"""
-One-shot admin script: clear row 1 of the Google Sheet and write the canonical
-header row from scene_annotator.SHEET_HEADERS so the two can never drift.
 
-Run after changing SHEET_HEADERS in scene_annotator.py:
-    python update_headers.py
-"""
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 

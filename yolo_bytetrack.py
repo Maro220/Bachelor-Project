@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import time
 import cv2
 import numpy as np
 from collections import Counter
@@ -98,7 +99,7 @@ MOTION_STATIONARY_PX     = 1.5    # px/frame below which = "stationary" (tuned f
 MOTION_SLOW_PX           = 8.0    # px/frame below which = "slow"
 MOTION_FAST_PX           = 25.0   # px/frame above which = "fast"
 YOLO_MODEL_PATH          = "yolo11l.pt"
-YOLO_CONF_THRESH         = 0.05   # Lowered from 0.20 — same car was flickering in/out at ~0.18-0.22
+YOLO_CONF_THRESH         = 0.03   # Lowered from 0.20 — same car was flickering in/out at ~0.18-0.22
 YOLO_INPUT_MAX_DIM       = 1600   # resize longest edge to this before inference
 YOLO_IMGSZ               = 1280   # inference resolution passed to ultralytics (was using default 640)
 
@@ -411,6 +412,193 @@ def reset_gt_state():
     _nuscenes_gt_by_frame = {}
 
 
+def _derive_action(obj_type: str, speed: str, direction: str) -> str:
+    """Map tracker speed/direction (GMC-corrected) to a human-readable action label.
+    Called instead of asking Qwen, which only sees a single static frame and cannot
+    judge motion reliably."""
+    t = obj_type.lower()
+    moving = speed not in ("stationary", "unknown")
+
+    if "traffic light" in t or (t == "light"):
+        return "static"
+    if any(x in t for x in ["person", "pedestrian"]):
+        if not moving:          return "standing"
+        if speed == "slow":     return "walking"
+        return "running"
+    if any(x in t for x in ["cyclist", "bicycle"]):
+        if not moving:          return "stopped"
+        if "left" in direction: return "turning"
+        if "right" in direction:return "turning"
+        return "moving"
+    # vehicles get "parked" when stationary; other non-vehicle objects
+    # (cones, barriers, debris, "other") get "static" instead — "parked"
+    # only makes sense for vehicles.
+    is_vehicle = t in VEHICLE_CLASSES or "vehicle" in t
+    if not is_vehicle:
+        return "moving" if moving else "static"
+    if not moving:              return "parked"
+    if "left" in direction:     return "turning left"
+    if "right" in direction:    return "turning right"
+    return "moving"
+
+
+def build_nuscenes_gt_2d(nusc, sd_records: list,
+                          image_size=(1600, 900)) -> dict:
+    """
+    Project NuScenes 3D sample annotations into 2D bboxes for every sweep
+    frame (~12 Hz), not just keyframes. 3D boxes are world-frame and valid at
+    any timestamp, so each sweep's own ego_pose gives an accurate 2D bbox.
+    Motion attributes (speed_label) come from nusc.box_velocity()
+    on the keyframe annotation; direction is computed per-instance from
+    sweep-to-sweep pixel displacement.
+
+    Output shape matches what set_nuscenes_gt() expects:
+      { "frames": [ { "frame_video_idx": <frame_idx>,
+                      "annotations": [ {instance_token, semantic_type,
+                                        visibility, bbox_2d, speed_label,
+                                        direction, action }, ... ]
+                    } ] }
+    """
+    from nuscenes.utils.geometry_utils import view_points
+    from nuscenes.utils.data_classes import Box as _NuscBox
+    from pyquaternion import Quaternion
+    import numpy as _np
+    import math as _math
+
+    W, H = image_size
+
+    calib = nusc.get("calibrated_sensor", sd_records[0]["calibrated_sensor_token"])
+    K     = _np.array(calib["camera_intrinsic"])
+
+    def _speed_label(v_mps: float) -> str:
+        if v_mps < 0.5: return "stationary"
+        if v_mps < 2.0: return "slow"
+        if v_mps < 8.0: return "moving"
+        return "fast"
+
+    def _direction(dx: float, dy: float, speed_label: str) -> str:
+        if speed_label == "stationary" or (abs(dx) < 1.0 and abs(dy) < 1.0):
+            return "stationary"
+        # Image y grows downward; flip so +y = up for human-readable labels
+        angle = _math.degrees(_math.atan2(-dy, dx))
+        if   -45 <= angle <  45: return "moving right"
+        elif  45 <= angle < 135: return "moving up"
+        elif -135 <= angle < -45:return "moving down"
+        else:                    return "moving left"
+
+    # Build keyframe annotation cache (raw 3D world-frame, indexed by sample_token).
+    # Sweeps inherit annotations from the most recent keyframe in the chain.
+    sample_annotations: dict = {}
+    for sd in sd_records:
+        if not sd["is_key_frame"]:
+            continue
+        sample = nusc.get("sample", sd["sample_token"])
+        anns = []
+        for ann_token in sample["anns"]:
+            ann = nusc.get("sample_annotation", ann_token)
+            cat = nusc.get("category",
+                           nusc.get("instance", ann["instance_token"])["category_token"])
+            if cat["name"] not in _NUSCENES_TO_YOLO_TYPE:
+                continue
+            try:
+                vis_lvl = int(nusc.get("visibility", ann.get("visibility_token", ""))["token"])
+            except (KeyError, ValueError):
+                vis_lvl = 0
+            try:
+                v_world   = nusc.box_velocity(ann_token)
+                speed_mps = float(_np.linalg.norm(v_world[:2]))
+                if _np.isnan(speed_mps):
+                    speed_mps = 0.0
+            except Exception:
+                speed_mps = 0.0
+            anns.append({
+                "instance_token": ann["instance_token"],
+                "semantic_type":  cat["name"],
+                "translation":    ann["translation"],
+                "size":           ann["size"],
+                "rotation":       ann["rotation"],
+                "visibility":     vis_lvl,
+                "speed_label":    _speed_label(speed_mps),
+            })
+        sample_annotations[sd["sample_token"]] = anns
+
+    def _project_box(ann_3d, ego_pose):
+        box = _NuscBox(ann_3d["translation"], ann_3d["size"],
+                       Quaternion(ann_3d["rotation"]))
+        box.translate(-_np.array(ego_pose["translation"]))
+        box.rotate(Quaternion(ego_pose["rotation"]).inverse)
+        box.translate(-_np.array(calib["translation"]))
+        box.rotate(Quaternion(calib["rotation"]).inverse)
+        corners_3d = box.corners()
+        # Reject if ANY corner is at or behind the camera plane. Partial
+        # behind-camera boxes blow up under perspective divide and clamp
+        # to a full-frame bbox; the object reappears cleanly on the next
+        # sweep once all 8 corners are in front.
+        if (corners_3d[2, :] <= 0.1).any():
+            return None
+        corners_2d = view_points(corners_3d, K, normalize=True)[:2]
+        x1_raw, y1_raw = float(corners_2d[0].min()), float(corners_2d[1].min())
+        x2_raw, y2_raw = float(corners_2d[0].max()), float(corners_2d[1].max())
+        # If the raw projection is fully outside the image, skip — clamping
+        # would otherwise glue it to the frame edge as a thin strip.
+        if x2_raw < 0 or y2_raw < 0 or x1_raw >= W or y1_raw >= H:
+            return None
+        x1 = max(0,   int(x1_raw))
+        y1 = max(0,   int(y1_raw))
+        x2 = min(W-1, int(x2_raw))
+        y2 = min(H-1, int(y2_raw))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0}
+
+    frames_out      = []
+    last_kf_anns    = []
+    prev_centers: dict = {}  # instance_token -> (cx, cy) from previous sweep
+
+    for frame_idx, sd in enumerate(sd_records):
+        ego_pose = nusc.get("ego_pose", sd["ego_pose_token"])
+        if sd["is_key_frame"]:
+            last_kf_anns = sample_annotations.get(sd["sample_token"], [])
+
+        anns_out = []
+        for ann_3d in last_kf_anns:
+            proj = _project_box(ann_3d, ego_pose)
+            if proj is None:
+                continue
+            it     = ann_3d["instance_token"]
+            cx, cy = proj["cx"], proj["cy"]
+
+            direction = "stationary"
+            if ann_3d["speed_label"] != "stationary" and it in prev_centers:
+                pcx, pcy = prev_centers[it]
+                direction = _direction(cx - pcx, cy - pcy, ann_3d["speed_label"])
+            prev_centers[it] = (cx, cy)
+
+            action = _derive_action(ann_3d["semantic_type"],
+                                    ann_3d["speed_label"], direction)
+
+            anns_out.append({
+                "instance_token": it,
+                "semantic_type":  ann_3d["semantic_type"],
+                "visibility":     ann_3d["visibility"],
+                "bbox_2d":        {"x1": proj["x1"], "y1": proj["y1"],
+                                   "x2": proj["x2"], "y2": proj["y2"]},
+                "speed_label":    ann_3d["speed_label"],
+                "direction":      direction,
+                "action":         action,
+            })
+
+        frames_out.append({
+            "frame_video_idx": frame_idx,
+            "annotations":     anns_out,
+        })
+
+    n_kf = sum(1 for sd in sd_records if sd["is_key_frame"])
+    print(f"✓ GT projected at all {len(frames_out)} sweep frames ({n_kf} keyframes)")
+    return {"frames": frames_out}
+
+
 def _bbox_iou(bb1: dict, bb2: dict) -> float:
     required = ("x1", "y1", "x2", "y2")
     if not bb1 or not bb2:
@@ -434,7 +622,7 @@ def merge_gt_into_detections(
     gt_annotations: list,
     frame_w:        int,
     frame_h:        int,
-    iou_threshold:  float = 0.3,
+    iou_threshold:  float = 0.2,
 ) -> dict:
     """
     Merge NuScenes GT annotations into yolo_data["detections"].
@@ -978,8 +1166,8 @@ def run_yolo_and_track(
             confidence = float(box.conf[0])
             area       = (x2 - x1) * (y2 - y1)
 
-            if area < MIN_DETECTION_AREA and cls_name != "traffic light":
-                continue
+         #   if area < MIN_DETECTION_AREA and cls_name != "traffic light":
+          #      continue
 
             sem_type = _semantic_type(cls_name)
             if sem_type in VEHICLE_CLASSES:    vehicle_count      += 1
@@ -1320,6 +1508,8 @@ def process_scene_sweeps(
     """
     global _tracker_actual_fps
 
+    _t_start = time.perf_counter()
+
     import shutil
     if not NUSCENES_AVAILABLE:
         raise RuntimeError("nuScenes SDK not available")
@@ -1431,7 +1621,9 @@ def process_scene_sweeps(
     with open(summary_path, "w") as f:
         json.dump(global_summary, f, indent=2)
 
-    print(f"\n✅ Processed {n_total} sweeps ({n_keyframes} keyframes)")
+    _elapsed = time.perf_counter() - _t_start
+    print(f"\n✅ Processed {n_total} sweeps ({n_keyframes} keyframes) "
+          f"in {_elapsed:.1f}s ({_elapsed / max(n_total, 1):.2f}s/sweep)")
     print(f"   Per-sweep:  {frames_dir}/")
     print(f"   Annotated:  {annotated_dir}/")
     print(f"   Keyframes:  {keyframes_dir}/  (sample-aligned for Qwen)")
