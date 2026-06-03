@@ -629,7 +629,6 @@ async function validateAndSubmit() {
                 driving_skill: document.getElementById('p_driving_skill').value,
             },
             free_text:    response,
-            top3_objects: _top3Data,
         };
 
         const r = await fetch('/api/submit_simple', {

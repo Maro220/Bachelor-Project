@@ -88,7 +88,7 @@ def _get_clip_text_emb_for_noun(noun: str):
     _clip_text_emb_by_noun[noun] = emb
     return emb
 
-TARGET_SCENE             = "scene-0757"   # NuScenes scene NAME (not a path) — SDK resolves frames from data/v1.0-mini/sweeps/CAM_FRONT/
+TARGET_SCENE             = "scene-0103"   # NuScenes scene NAME (not a path) — SDK resolves frames from data/v1.0-mini/sweeps/CAM_FRONT/
 TRACKER_FRAME_RATE       = 0      # frames per second fed to tracker (0 = auto: all frames at video fps)
 MIN_DETECTION_AREA       = 150    # min pixel area for non-traffic-light detections
 TRACK_ACTIVATION_THRESH  = 0.25   # ByteTrack: min confidence to activate track (raised from 0.15)
@@ -146,7 +146,9 @@ _HSV_PALETTE = [
     ("gray",   (0,   0,   51),  (180, 25,  199)),
     ("brown",  (10,  40,  40),  (20,  200, 150)),
 ]
-
+# ── Color extraction tuning ──────────────────────────────────────────────────
+COLOR_DEBUG          = False   # set True to log per-crop color decisions
+COLOR_MIN_BOX_AREA   = 2500    # px² — below this, paint signal is unreliable → "unknown"
 
 def extract_dominant_color(frame_bgr: np.ndarray, bbox: Dict, obj_type: str = "",
                             other_bboxes: Optional[List[Dict]] = None) -> str:
@@ -159,7 +161,13 @@ def extract_dominant_color(frame_bgr: np.ndarray, bbox: Dict, obj_type: str = ""
         return "unknown"
 
     if obj_type in VEHICLE_CLASSES:
-        y2 = y1 + max(4, int((y2 - y1) * 0.70))
+        # Sample the middle-lower body strip (35%-85% of bbox height) —
+        # skips windshield/roof glare on top and bumper shadow on bottom,
+        # where the actual paint colour lives.
+        h     = y2 - y1
+        new_y1 = y1 + max(2, int(h * 0.35))
+        new_y2 = y1 + max(new_y1 + 4, int(h * 0.85))
+        y1, y2 = new_y1, new_y2
 
     pw = max(1, int((x2 - x1) * 0.15))
     ph = max(1, int((y2 - y1) * 0.15))
@@ -223,6 +231,11 @@ def extract_dominant_color_clip(frame_bgr: np.ndarray, bbox: Dict,
     """
     Extract vehicle color using CLIP zero-shot classification.
     Returns (color_name, confidence). Falls back to HSV if CLIP unavailable.
+
+    Tiny boxes (< COLOR_MIN_BOX_AREA) carry almost no paint signal at this
+    camera scale, so they return ("unknown", 0.0) rather than being snapped
+    to black by the brightness prior. TrackState voting ignores "unknown",
+    so a car simply acquires a color once it's close enough to read.
     """
     _init_clip()
 
@@ -234,21 +247,63 @@ def extract_dominant_color_clip(frame_bgr: np.ndarray, bbox: Dict,
     if x2 <= x1 or y2 <= y1:
         return "unknown", 0.0
 
+    # ── Size gate ────────────────────────────────────────────────────────────
+    # A 30x20 crop is mostly shadow/tire/road; any color call is a guess.
+    box_area = (x2 - x1) * (y2 - y1)
+    if box_area < COLOR_MIN_BOX_AREA:
+        if COLOR_DEBUG:
+            print(f"  [color] {obj_type} area={box_area} < {COLOR_MIN_BOX_AREA} "
+                  f"→ unknown (too small)")
+        return "unknown", 0.0
+
     if obj_type in VEHICLE_CLASSES:
-        y2 = y1 + max(8, int((y2 - y1) * 0.70))
+        # Middle-lower body strip — skip windshield glare (top) and
+        # bumper shadow (bottom) which biased CLIP toward "white".
+        h      = y2 - y1
+        new_y1 = y1 + max(4, int(h * 0.35))
+        new_y2 = y1 + max(new_y1 + 8, int(h * 0.85))
+        y1, y2 = new_y1, new_y2
 
     crop_bgr = frame_bgr[y1:y2, x1:x2].copy()
     if crop_bgr.size == 0:
         return "unknown", 0.0
 
-    crop_bgr  = _normalize_illumination(crop_bgr)
-    low_light = _is_low_light(crop_bgr)
+    # Brightness/saturation prior on the RAW crop — CLAHE would brighten a
+    # black body into mid-tone gray and bias CLIP toward "silver"/"gray".
+    raw_gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    raw_mean = float(raw_gray.mean())
+    raw_std  = float(raw_gray.std())
+    raw_hsv  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    raw_sat  = float(raw_hsv[..., 1].mean())
+
+    def _dbg(decision: str, conf: float, extra: str = ""):
+        if COLOR_DEBUG:
+            print(f"  [color] {obj_type} area={box_area} "
+                  f"mean={raw_mean:.0f} sat={raw_sat:.0f} std={raw_std:.0f} "
+                  f"→ {decision} ({conf:.2f}) {extra}")
+
+    # Trust brightness over CLIP only at the extremes. The black snap now
+    # also requires LOW variance: a genuinely black body is uniformly dark,
+    # whereas a light car with a few shadow/tire pixels has high variance and
+    # a low mean — that case must reach CLIP, not snap to black.
+    if raw_mean < 50 and raw_sat < 40 and raw_std < 35:
+        _dbg("black", 0.9, "[raw snap]")
+        return "black", 0.9
+    if raw_mean > 200 and raw_sat < 25:
+        _dbg("white", 0.9, "[raw snap]")
+        return "white", 0.9
+    # Intentionally no silver pre-snap — silver overlaps the same brightness
+    # range as dark cars with chrome/window highlights.
+
+    # Only normalize illumination when the crop isn't already at an extreme.
+    crop_for_clip = _normalize_illumination(crop_bgr)
+    low_light     = raw_mean < 45
 
     if _clip_model is not None and CLIP_AVAILABLE:
         try:
             import torch
             from PIL import Image as _PIL_Image
-            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            crop_rgb = cv2.cvtColor(crop_for_clip, cv2.COLOR_BGR2RGB)
             pil_img  = _PIL_Image.fromarray(crop_rgb)
             noun     = _TYPE_NOUN.get(obj_type, _DEFAULT_NOUN)
             text_emb = _get_clip_text_emb_for_noun(noun)
@@ -261,20 +316,36 @@ def extract_dominant_color_clip(frame_bgr: np.ndarray, bbox: Dict,
             confidence = float(probs[best_idx])
             color_name = _COLOR_NAMES[best_idx]
 
+            # CLIP said gray/silver/white but the raw body is genuinely dark
+            # AND uniform → override to black. Tightened from mean<120 to
+            # mean<60 + std gate: the old threshold caught shadowed silver
+            # and white cars (mean 80-115) and collapsed them all to black.
+            if (color_name in ("gray", "silver", "white")
+                    and raw_mean < 60 and raw_sat < 25 and raw_std < 40):
+                _dbg("black", max(0.5, confidence),
+                     f"[override from {color_name}]")
+                return "black", max(0.5, confidence)
+
+            # For vehicles, "gray" almost always means silver in practice.
+            if color_name == "gray" and obj_type in VEHICLE_CLASSES:
+                color_name = "silver"
+
             if low_light and confidence < 0.55:
+                _dbg("dark", 0.3, "[low light]")
                 return "dark", 0.3
             if confidence < 0.35:
+                _dbg("unknown", confidence, "[low conf]")
                 return "unknown", confidence
+            _dbg(color_name, confidence, "[clip]")
             return color_name, confidence
         except Exception as e:
             print(f"  ⚠   CLIP color extraction error: {e}. Falling back to HSV.")
 
-
     norm_bbox = {"x1": 0, "y1": 0,
                  "x2": crop_bgr.shape[1], "y2": crop_bgr.shape[0]}
     color_hsv = extract_dominant_color(crop_bgr, norm_bbox, obj_type, other_bboxes)
+    _dbg(color_hsv, 0.6, "[hsv fallback]")
     return color_hsv, 0.6
-
 
 #  NuScenes SDK loader 
 _nusc = None  
@@ -1413,6 +1484,14 @@ def run_yolo_and_track(
             if obj_type in VEHICLE_CLASSES or obj_type == "cyclist":
                 obj_entry["size"] = _size_label(bbox, w_orig, h_orig)
             tracked_objects.append(obj_entry)
+
+    # Recount from the post-tracker, post-GT-merge list — the pre-tracker
+    # YOLO counters overcount because YOLO_CONF_THRESH=0.03 produces many
+    # overlapping low-conf boxes per real object.
+    vehicle_count       = sum(1 for o in tracked_objects if o.get("type") in VEHICLE_CLASSES)
+    pedestrian_count    = sum(1 for o in tracked_objects if o.get("type") == "pedestrian")
+    cyclist_count       = sum(1 for o in tracked_objects if o.get("type") == "cyclist")
+    traffic_light_count = sum(1 for o in tracked_objects if o.get("type") == "traffic_light")
 
     output = {
         "frame":      frame_idx,

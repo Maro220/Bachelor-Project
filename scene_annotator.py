@@ -26,7 +26,7 @@ import cv2
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
 try:
-    import yolo_bytetrack as _ybt  # module reference for mutable globals (e.g. _nuscenes_gt_by_frame)
+    import yolo_bytetrack as _ybt 
     from yolo_bytetrack import (
         run_yolo_and_track,
         process_scene_sweeps,
@@ -57,8 +57,6 @@ except Exception as e:
     _bbox_iou = lambda a, b: 0.0
     _derive_action = None
     build_nuscenes_gt_2d = None
-
-
 def _gt_by_frame() -> dict:
     """Current GT-by-frame map. Goes through the module so reassignments
     inside yolo_bytetrack.set_nuscenes_gt() are visible here."""
@@ -81,7 +79,7 @@ except ImportError:
     YOLO_AVAILABLE = False
     print("ultralytics not installed. Skipping YOLO detection.")
 
-OLLAMA_URL       = "http://localhost:11434/api/chat"
+OLLAMA_URL       = "http://127.0.0.1:11434/api/chat"
 MODEL     = "qwen2.5vl:7b"
 CREDENTIALS_FILE = "credentials.json"
 OAUTH_FILE       = "oauth_client.json"
@@ -109,7 +107,7 @@ VEHICLE_CLASSES       = {"car", "van", "motorcycle", "bus", "truck"}
 
 def _infer_scene_fields_from_nuscenes(description: str) -> dict:
     
-    #Map a NuScenes scene description (e.g. 'Parked truck, construction,
+   # Map a NuScenes scene description (e.g. 'Parked truck, construction,
    # intersection, turn left') to environment + lighting. Both are locked from
    # the NuScenes description; Qwen no longer chooses either.
    
@@ -1548,8 +1546,8 @@ RULES:
               f"split={len(split_tracks)}, fragmented={len(fragmented_gt)}")
 
     os.makedirs(summaries_dir, exist_ok=True)
-    _dump_json(f"{summaries_dir}/output_cumulative_mega.json", cumulative)
-    print(f"  Saved: {summaries_dir}/output_cumulative_mega.json")
+    _dump_json(f"{summaries_dir}/output_cumulative.json", cumulative)
+    print(f"  Saved: {summaries_dir}/output_cumulative.json")
     return cumulative
 
 def process_scene(scene_name: str):
@@ -1721,7 +1719,7 @@ def process_scene(scene_name: str):
             dataroot        = NUSCENES_DATAROOT,
             stable_fields   = stable_fields,
             video_fps       = sweep_fps,
-            no_qwen         = _no_qwen,
+            no_qwen         = True,
             override_ids    = _override_ids,
             override_sec    = _override_sec,
         )
@@ -1869,7 +1867,6 @@ def api_submit_simple():
     data             = request.get_json(force=True)
     participant_name = data.get("participant_name", "").strip()
     free_text        = data.get("free_text", "").strip()
-    top3_objects     = data.get("top3_objects", [])
     scene_id         = data.get("scene_id", TARGET_SCENE or "unknown")
 
     if not participant_name or not free_text:
@@ -1881,7 +1878,6 @@ def api_submit_simple():
         "participant_info": data.get("participant_info", {}),
         "scene_id":         scene_id,
         "free_text":        free_text,
-        "top3_objects":     top3_objects,
     }
     os.makedirs(f"annotations/{_ACTIVE_SCENE_NAME}/simple", exist_ok=True)
     fname = f"annotations/{_ACTIVE_SCENE_NAME}/simple/{participant_name}_{scene_id}_simple.json"

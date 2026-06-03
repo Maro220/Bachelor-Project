@@ -92,6 +92,16 @@ def _identity_of(obj: dict) -> Optional[str]:
     return None
 
 
+def _majority(values: List[str], default: str = "unknown") -> str:
+    """Most common non-unknown/empty value; falls back to `default`.
+    Used so a single mislabeled keyframe can't lock a wrong color/type
+    for the rest of the pipeline."""
+    filtered = [v for v in values if v and v != "unknown"]
+    if not filtered:
+        return default
+    return max(set(filtered), key=filtered.count)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 1 — lock top-3 identities from full keyframe output
 # ════════════════════════════════════════════════════════════════════════════
@@ -146,20 +156,24 @@ def lock_top3_identities(full_out_dir: str) -> List[Dict]:
             if ident not in agg:
                 agg[ident] = {
                     "identity":       ident,
-                    "object_type":    obj.get("object_type") or obj.get("type", "object"),
-                    "color":          obj.get("color", "unknown"),
+                    "_type_votes":    [],
+                    "_color_votes":   [],
                     "gt_sourced":     obj.get("gt_sourced", False),
                     "total_area":     0,
                     "seen_keyframes": [],
                 }
             agg[ident]["total_area"] += area
             agg[ident]["seen_keyframes"].append(kf_idx)
-            # update color if we get a better (non-unknown) one
-            if agg[ident]["color"] in ("unknown", "") and obj.get("color", "unknown") not in ("unknown", ""):
-                agg[ident]["color"] = obj["color"]
+            agg[ident]["_type_votes"].append(obj.get("object_type") or obj.get("type", ""))
+            agg[ident]["_color_votes"].append(obj.get("color", ""))
             # promote gt_sourced if any frame confirms it
             if obj.get("gt_sourced"):
                 agg[ident]["gt_sourced"] = True
+
+    # Resolve majority votes — single mislabeled keyframes shouldn't win.
+    for entry in agg.values():
+        entry["object_type"] = _majority(entry.pop("_type_votes"), default="object")
+        entry["color"]       = _majority(entry.pop("_color_votes"), default="unknown")
 
     all_identities = list(agg.values())
     gt_objs   = [x for x in all_identities if x["gt_sourced"]]
@@ -202,8 +216,8 @@ def _build_identities_from_override(override_ids: List[str],
 
     agg = {ident: {
         "identity":       ident,
-        "object_type":    "object",
-        "color":          "unknown",
+        "_type_votes":    [],
+        "_color_votes":   [],
         "gt_sourced":     False,
         "total_area":     0,
         "seen_keyframes": [],
@@ -219,12 +233,14 @@ def _build_identities_from_override(override_ids: List[str],
                 continue
             agg[ident]["total_area"] += _bbox_area(obj.get("bounding_box", {}))
             agg[ident]["seen_keyframes"].append(kf_idx)
-            if obj.get("object_type") or obj.get("type"):
-                agg[ident]["object_type"] = obj.get("object_type") or obj.get("type")
-            if agg[ident]["color"] in ("unknown", "") and obj.get("color", "unknown") not in ("unknown", ""):
-                agg[ident]["color"] = obj["color"]
+            agg[ident]["_type_votes"].append(obj.get("object_type") or obj.get("type", ""))
+            agg[ident]["_color_votes"].append(obj.get("color", ""))
             if obj.get("gt_sourced"):
                 agg[ident]["gt_sourced"] = True
+
+    for entry in agg.values():
+        entry["object_type"] = _majority(entry.pop("_type_votes"), default="object")
+        entry["color"]       = _majority(entry.pop("_color_votes"), default="unknown")
 
     missing = [i for i in override_ids if agg[i]["total_area"] == 0]
     if missing:
