@@ -90,8 +90,7 @@ SERVER_PORT      = 7860
 DEFAULT_SCENE    = "scene-0103" 
 DEFAULT_TARGET   = f"output_nuscenes/{DEFAULT_SCENE}/{DEFAULT_SCENE}_CAM_FRONT.mp4"
 
-# Active scene output root — set at runtime by process_scene() or serve_form.py.
-# All Flask routes read from this so the server always points at the right scene.
+
 _SCENE_OUT_DIR    = "output/scene-0757"   # safe default, overwritten at runtime
 _ACTIVE_SCENE_NAME = "scene-0757"         # safe default, overwritten at runtime
 
@@ -1719,7 +1718,7 @@ def process_scene(scene_name: str):
             dataroot        = NUSCENES_DATAROOT,
             stable_fields   = stable_fields,
             video_fps       = sweep_fps,
-            no_qwen         = True,
+            no_qwen         = False,
             override_ids    = _override_ids,
             override_sec    = _override_sec,
         )
